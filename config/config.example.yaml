@@ -1,0 +1,67 @@
+# Copy this file to config.local.yaml and fill in your preferences
+# config.local.yaml is gitignored and will not be committed
+
+search:
+  # Vehicle criteria
+  make: "Dodge"
+  model: "Grand Caravan"
+  yearMin: 2015
+  yearMax: 2020
+  mileageMax: 120000  # km
+  priceMax: 20000     # CAD
+
+  # Location
+  postalCode: "M5V1J1"  # Your postal code
+  radiusKm: 100         # Search radius
+
+  # Sites to search
+  sites:
+    - cargurus
+    - autotrader
+    # - kijiji  # Coming soon
+
+scoring:
+  # Weights for ranking (0-1, should sum to 1)
+  weights:
+    price: 0.25
+    mileage: 0.25
+    accidentHistory: 0.20
+    ownerCount: 0.10
+    serviceRecords: 0.10
+    dealerRating: 0.10
+
+  # Deal breakers - reject if any are true
+  dealBreakers:
+    - salvageTitle
+    - frameDamage
+    - floodDamage
+    - commercialUse  # Taxis, delivery vehicles, etc.
+
+  # Preferences (not deal breakers, but affect score)
+  preferences:
+    preferPrivateSeller: false
+    preferCertified: false
+    maxOwners: 3
+
+email:
+  # Your contact email for dealer communications
+  fromName: "Your Name"
+  fromEmail: "your-car-search@gmail.com"
+
+  # IMAP settings (Gmail example)
+  imap:
+    host: "imap.gmail.com"
+    port: 993
+    secure: true
+
+  # SMTP settings (Gmail example)
+  smtp:
+    host: "smtp.gmail.com"
+    port: 587
+    secure: false
+
+# Personal notes (completely private, never shared with dealers)
+privateNotes: |
+  Add any personal notes about your specific needs here.
+  For example: specific comfort requirements, must-have features,
+  planned usage scenarios, etc.
