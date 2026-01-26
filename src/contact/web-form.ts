@@ -186,55 +186,111 @@ export class WebFormContact {
       console.log('  Warning: Could not find name field');
     }
 
-    // Email field
+    // Email field - REQUIRED
     const emailSelectors = [
       'input[type="email"]',
-      'input[name*="email"]',
+      'input[name*="email" i]',
+      'input[name*="Email"]',
+      'input[placeholder*="email" i]',
       'input[placeholder*="Email"]',
-      'input[id*="email"]',
+      'input[id*="email" i]',
+      'input[autocomplete="email"]',
+      '[data-testid*="email"] input',
+      'input[aria-label*="email" i]',
     ];
+    let emailFilled = false;
     for (const selector of emailSelectors) {
-      const field = await page.$(selector);
-      if (field && await field.isVisible()) {
-        await field.fill(formData.email);
-        console.log(`  Filled email: ${formData.email}`);
-        break;
+      try {
+        const field = await page.$(selector);
+        if (field && await field.isVisible()) {
+          await field.fill(formData.email);
+          console.log(`  Filled email: ${formData.email}`);
+          emailFilled = true;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+    if (!emailFilled) {
+      console.log('  ⚠️ WARNING: Could not find email field!');
+      // Debug: list all visible input fields
+      const allInputs = await page.$$('input:visible');
+      console.log(`  Debug: Found ${allInputs.length} visible input fields`);
+      for (const input of allInputs.slice(0, 5)) {
+        const type = await input.getAttribute('type');
+        const name = await input.getAttribute('name');
+        const placeholder = await input.getAttribute('placeholder');
+        console.log(`    - type="${type}" name="${name}" placeholder="${placeholder}"`);
       }
     }
 
-    // Phone field (optional)
+    // Phone field (optional but try to fill)
+    let phoneFilled = false;
     if (formData.phone) {
       const phoneSelectors = [
         'input[type="tel"]',
-        'input[name*="phone"]',
+        'input[name*="phone" i]',
+        'input[name*="Phone"]',
+        'input[placeholder*="phone" i]',
         'input[placeholder*="Phone"]',
-        'input[id*="phone"]',
+        'input[id*="phone" i]',
+        'input[autocomplete="tel"]',
+        '[data-testid*="phone"] input',
       ];
       for (const selector of phoneSelectors) {
-        const field = await page.$(selector);
-        if (field && await field.isVisible()) {
-          await field.fill(formData.phone);
-          console.log(`  Filled phone: ${formData.phone}`);
-          break;
+        try {
+          const field = await page.$(selector);
+          if (field && await field.isVisible()) {
+            await field.fill(formData.phone);
+            console.log(`  Filled phone: ${formData.phone}`);
+            phoneFilled = true;
+            break;
+          }
+        } catch {
+          continue;
         }
+      }
+      if (!phoneFilled) {
+        console.log('  Note: Could not find phone field (optional)');
       }
     }
 
-    // Message field
+    // Message field - REQUIRED
     const messageSelectors = [
-      'textarea[name*="message"]',
-      'textarea[name*="comment"]',
-      'textarea[placeholder*="Message"]',
-      'textarea[id*="message"]',
-      'textarea',
+      'textarea[name*="message" i]',
+      'textarea[name*="comment" i]',
+      'textarea[placeholder*="message" i]',
+      'textarea[id*="message" i]',
+      'textarea[aria-label*="message" i]',
+      'textarea',  // Last resort: any textarea
     ];
+    let messageFilled = false;
     for (const selector of messageSelectors) {
-      const field = await page.$(selector);
-      if (field && await field.isVisible()) {
-        await field.fill(formData.message);
-        console.log(`  Filled message: ${formData.message.slice(0, 50)}...`);
-        break;
+      try {
+        const field = await page.$(selector);
+        if (field && await field.isVisible()) {
+          await field.fill(formData.message);
+          console.log(`  Filled message: ${formData.message.slice(0, 50)}...`);
+          messageFilled = true;
+          break;
+        }
+      } catch {
+        continue;
       }
+    }
+    if (!messageFilled) {
+      console.log('  ⚠️ WARNING: Could not find message field!');
+    }
+
+    // Check if required fields were filled - ABORT if not
+    if (!nameFilled || !emailFilled) {
+      console.log('\n❌ ABORTING: Required fields not filled (need at least name and email)');
+      return {
+        success: false,
+        method: 'web_form',
+        message: `Missing required fields: ${!nameFilled ? 'name ' : ''}${!emailFilled ? 'email' : ''}`.trim(),
+      };
     }
 
     // Uncheck all marketing/spam checkboxes aggressively
@@ -401,6 +457,11 @@ export class WebFormContact {
     await submitButton.click();
     await randomDelay(3000, 4000);
 
+    // Take screenshot after submission for verification
+    const screenshotPath = `/tmp/contact-form-${Date.now()}.png`;
+    await page.screenshot({ path: screenshotPath, fullPage: false });
+    console.log(`  📸 Post-submit screenshot: ${screenshotPath}`);
+
     // Check for success indicators
     const pageContent = await page.textContent('body') || '';
     const successPatterns = [
@@ -413,11 +474,32 @@ export class WebFormContact {
 
     for (const pattern of successPatterns) {
       if (pattern.test(pageContent)) {
-        console.log('Form submitted successfully!');
+        console.log('✅ Form submitted successfully!');
         return {
           success: true,
           method: 'web_form',
           message: 'Contact form submitted successfully',
+          screenshotPath,
+        };
+      }
+    }
+
+    // Check for error messages
+    const errorPatterns = [
+      /please (fill|enter|provide)/i,
+      /required field/i,
+      /invalid (email|phone)/i,
+      /error/i,
+    ];
+
+    for (const pattern of errorPatterns) {
+      if (pattern.test(pageContent)) {
+        console.log('❌ Form submission failed - error detected on page');
+        return {
+          success: false,
+          method: 'web_form',
+          message: 'Form submission failed - validation error on page',
+          screenshotPath,
         };
       }
     }
@@ -430,15 +512,17 @@ export class WebFormContact {
         success: true,
         method: 'web_form',
         message: 'Form submitted (form closed)',
+        screenshotPath,
       };
     }
 
     // If we got here, form might have submitted but no clear indicator
-    console.log('Form clicked but no clear success indicator');
+    console.log('⚠️ Form clicked but no clear success/failure indicator');
     return {
       success: true,
       method: 'web_form',
-      message: 'Form submitted (no confirmation detected)',
+      message: 'Form submitted (no confirmation detected) - check screenshot',
+      screenshotPath,
     };
   }
 
