@@ -6,8 +6,11 @@ import { calculateTotalCost } from '../../pricing/calculator.js';
 import { WebFormContact, generateContactMessage } from '../../contact/web-form.js';
 import { EmailClient } from '../../email/client.js';
 import { generateEmail } from '../../email/templates.js';
+import { analyzeCarfaxBuffer } from '../../analyzers/carfax-analyzer.js';
 import type { ListingAnalysis } from '../../analyzers/listing-analyzer.js';
 import type { Listing } from '../../database/client.js';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export const outreachCommand = new Command('outreach')
   .description('Automatically contact top-ranked listings')
@@ -291,8 +294,65 @@ export const autoRespondCommand = new Command('auto-respond')
 
           if (hasCarfax) {
             console.log('📄 CARFAX detected in attachments!');
-            // TODO: Save and analyze CARFAX
-            db.updateListing(matchedListing.id, { carfaxReceived: true });
+
+            // Find the CARFAX attachment
+            const carfaxAttachment = email.attachments.find(
+              a => a.contentType === 'application/pdf' &&
+                   (a.filename.toLowerCase().includes('carfax') ||
+                    a.filename.toLowerCase().includes('history'))
+            );
+
+            if (carfaxAttachment) {
+              // Save CARFAX to disk
+              const carfaxDir = path.join('data', 'carfax');
+              fs.mkdirSync(carfaxDir, { recursive: true });
+              const carfaxPath = path.join(carfaxDir, `listing-${matchedListing.id}.pdf`);
+              fs.writeFileSync(carfaxPath, carfaxAttachment.content);
+              console.log(`   Saved to: ${carfaxPath}`);
+
+              // Analyze CARFAX
+              try {
+                console.log('   Analyzing CARFAX...');
+                const analysis = await analyzeCarfaxBuffer(carfaxAttachment.content);
+
+                const riskEmoji: Record<string, string> = {
+                  'severe': '🔴',
+                  'high': '🟠',
+                  'medium': '🟡',
+                  'low': '🟢',
+                };
+                console.log(`   ${riskEmoji[analysis.riskLevel]} Risk: ${analysis.riskLevel.toUpperCase()}`);
+                console.log(`   Accidents: ${analysis.data.accidentCount} | Owners: ${analysis.data.ownerCount || 'N/A'}`);
+
+                // Update listing with CARFAX data
+                db.updateListing(matchedListing.id, {
+                  carfaxReceived: true,
+                  carfaxPath,
+                  accidentCount: analysis.data.accidentCount,
+                  ownerCount: analysis.data.ownerCount,
+                  serviceRecordCount: analysis.data.serviceRecordCount,
+                  carfaxSummary: analysis.summary,
+                });
+
+                // Add risk factors to notes
+                if (analysis.riskFactors.length > 0) {
+                  const existingNotes = matchedListing.notes || '';
+                  const carfaxNotes = `\n[CARFAX ${new Date().toISOString().split('T')[0]}]\nRisk: ${analysis.riskLevel}\n${analysis.riskFactors.map(f => `- ${f}`).join('\n')}`;
+                  db.updateListing(matchedListing.id, {
+                    notes: existingNotes + carfaxNotes,
+                  });
+                }
+
+                console.log('   ✅ CARFAX analyzed and saved');
+              } catch (analyzeError) {
+                console.log(`   ⚠️ Analysis failed: ${analyzeError}`);
+                // Still mark as received even if analysis failed
+                db.updateListing(matchedListing.id, {
+                  carfaxReceived: true,
+                  carfaxPath,
+                });
+              }
+            }
           } else if (!matchedListing.carfaxReceived) {
             // No CARFAX yet - send request
             console.log('📄 No CARFAX yet - generating request...');

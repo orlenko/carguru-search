@@ -1,13 +1,13 @@
 /**
- * AI-powered price negotiation using tactics from "Never Split the Difference"
+ * AI-powered price negotiation for email/text-based car buying
  *
- * Key principles:
- * - Never split the difference (don't meet in the middle)
- * - Use calibrated questions to make them solve your problem
- * - Label emotions to defuse them
- * - Mirror to build rapport and gather info
- * - Get to "no" - people feel safe saying no
- * - Use precise numbers (they seem more credible)
+ * Key principles for WRITTEN negotiations:
+ * - Patience is power (you control timing, no pressure to respond immediately)
+ * - Research is leverage (market data, comparables, vehicle history)
+ * - Brevity is professional (dealers handle hundreds of emails)
+ * - Specificity is credibility (precise numbers with clear justification)
+ * - Silence is a tactic (slow responses reduce urgency)
+ * - Everything is documented (reference previous statements)
  */
 
 import { writeFileSync, unlinkSync } from 'fs';
@@ -46,42 +46,56 @@ export interface NegotiationResponse {
   escalationReason?: string;
 }
 
-const NEGOTIATION_PROMPT = `You are an expert car buyer negotiator using tactics from "Never Split the Difference" by Chris Voss. You're negotiating on behalf of a buyer who wants a fair deal but won't be manipulated.
+const NEGOTIATION_PROMPT = `You are helping negotiate a car purchase via email. Generate professional, concise responses that a real buyer would send.
 
-KEY TACTICS TO USE:
-1. MIRRORING: Repeat the last 1-3 critical words they said. This builds rapport and gets them talking.
-   Example: Dealer says "The price is firm because of the low mileage"
-   You say: "The low mileage?"
+EFFECTIVE EMAIL NEGOTIATION TACTICS FOR CAR BUYING:
 
-2. LABELING: Identify and verbalize their feelings/position. Start with "It seems like...", "It sounds like...", "It looks like..."
-   Example: "It sounds like you've had a lot of interest in this vehicle."
+1. MARKET DATA LEVERAGE
+   - Reference specific comparable listings ("I found a similar 2016 Grand Caravan with lower mileage listed for $11,500")
+   - Cite average market prices ("Based on AutoTrader listings, these typically sell for $X-$Y")
+   - Mention time on market if vehicle has been listed long
 
-3. CALIBRATED QUESTIONS: Ask "How" and "What" questions that make them solve your problem.
-   - "How am I supposed to do that?" (when price is too high)
-   - "What would it take to make this work?"
-   - "How can we bridge this gap?"
+2. VEHICLE-SPECIFIC LEVERAGE
+   - Reference CARFAX issues (accidents, owners, service gaps)
+   - Point out listing concerns (high mileage, wear items due, etc.)
+   - Note missing information that affects value
 
-4. GETTING TO NO: Ask questions designed to get "no" - it makes people feel safe and in control.
-   - "Is it a ridiculous idea to consider $X?"
-   - "Would it be unreasonable to ask for..."
+3. BUYER LEVERAGE
+   - Pre-approved financing / cash ready
+   - Flexible on timing (can close quickly OR no rush)
+   - Looking at multiple options (creates competition)
+   - Serious buyer, not just browsing
 
-5. PRECISE NUMBERS: Use specific numbers like $12,847 instead of $13,000. They seem more calculated and credible.
+4. DEALER-SPECIFIC LEVERAGE (for dealers only)
+   - End of month/quarter timing
+   - Ask about all-in pricing (OTD - out the door)
+   - Request fee breakdown
+   - Vehicle age on their lot costs them money
 
-6. ACCUSATION AUDIT: Preemptively acknowledge negatives before they bring them up.
-   - "You're probably going to think I'm being unreasonable, but..."
-   - "I know this might seem like a lowball offer..."
+5. RESPONSE TIMING STRATEGY
+   - Don't respond immediately to counter-offers (shows you're considering options)
+   - Set reasonable deadlines when appropriate ("I need to decide by Friday")
 
-7. THE LATE-NIGHT FM DJ VOICE: Keep tone calm, slow, and reassuring (convey this in word choice).
+TONE AND FORMAT:
+- Keep emails SHORT (3-5 sentences max for most responses)
+- Be professional and direct, not manipulative
+- Don't over-explain or sound desperate
+- One clear ask per email
+- No excessive pleasantries or padding
 
-8. NEVER SPLIT THE DIFFERENCE: Don't offer to meet in the middle. Make them move toward you.
+WHAT NOT TO DO:
+- Don't reveal your maximum budget
+- Don't express too much enthusiasm ("I love this car!")
+- Don't use psychological manipulation tactics that sound awkward in writing
+- Don't send long rambling emails
+- Don't counter immediately - brief pause is fine
+- Don't make threats you won't follow through on
 
-RULES:
-- Never reveal the maximum budget or walk-away price
-- Always justify offers with objective criteria (market data, vehicle issues, etc.)
-- Be respectful but firm - don't apologize for negotiating
-- If they use pressure tactics ("another buyer coming"), don't react emotionally
-- If they won't budge at all after 3 exchanges, consider walking away
-- Reference specific issues from the listing or CARFAX if available
+OFFER STRATEGY:
+- Opening offer: 10-15% below asking (reasonable, not insulting)
+- Counter-offers: Move in smaller increments as you approach agreement
+- Always justify your number with data or specific concerns
+- Use precise numbers ($11,750 not $12,000) - they seem more calculated
 
 CONTEXT:
 {context}
@@ -92,10 +106,12 @@ CONVERSATION SO FAR:
 DEALER'S LATEST MESSAGE:
 {dealer_message}
 
-Generate a response. Output JSON:
+Generate a response. Keep it brief and professional - this is a real email to send.
+
+Output JSON:
 {
-  "message": "Your response to the dealer (the actual text to send)",
-  "tactic": "Which tactic(s) you're using",
+  "message": "Your email response (the actual text to send - keep it concise)",
+  "tactic": "Brief description of your approach",
   "reasoning": "Why this approach for this situation",
   "suggestedOffer": null or a specific dollar amount if making a counter-offer,
   "shouldEscalateToHuman": false,
@@ -103,10 +119,10 @@ Generate a response. Output JSON:
 }
 
 Set shouldEscalateToHuman to true ONLY if:
-- They've accepted our offer (need human to confirm and schedule)
-- We've reached an impasse after multiple attempts
-- They're asking to schedule a viewing (human decision)
-- Something unusual requires human judgment`;
+- They've accepted our offer (human needs to confirm and arrange payment/pickup)
+- They're asking to schedule a viewing (human decision needed)
+- They're asking for personal information beyond email
+- Negotiation has stalled after 4+ exchanges with no movement`;
 
 /**
  * Generate a negotiation response using AI
@@ -123,23 +139,27 @@ export async function generateNegotiationResponse(
 Vehicle: ${vehicle}
 Listed Price: $${context.listing.price?.toLocaleString() || 'Unknown'}
 Our Target Price: $${context.targetPrice.toLocaleString()}
-Walk-Away Price: $${context.walkAwayPrice.toLocaleString()} (DO NOT REVEAL THIS)
+Walk-Away Price: $${context.walkAwayPrice.toLocaleString()} (DO NOT REVEAL)
+Seller Type: ${context.listing.sellerType || 'Unknown'}
 Current Stage: ${context.stage}
+Exchange Count: ${context.conversationHistory.length}
 ${context.currentOffer ? `Dealer's Current Offer: $${context.currentOffer.toLocaleString()}` : ''}
 ${context.ourLastOffer ? `Our Last Offer: $${context.ourLastOffer.toLocaleString()}` : ''}
 ${context.marketData ? `
 Market Data:
-  - Average price for similar vehicles: $${context.marketData.averagePrice.toLocaleString()}
-  - Lowest comparable listing: $${context.marketData.lowestPrice.toLocaleString()}
-  - Number of comparable listings: ${context.marketData.comparableListings}
+  - Average price for similar: $${context.marketData.averagePrice.toLocaleString()}
+  - Lowest comparable: $${context.marketData.lowestPrice.toLocaleString()}
+  - Comparable listings found: ${context.marketData.comparableListings}
 ` : ''}
+${context.listing.redFlags?.length ? `Vehicle Concerns: ${context.listing.redFlags.join('; ')}` : ''}
+${context.listing.carfaxReceived ? `CARFAX: ${context.listing.accidentCount || 0} accidents, ${context.listing.ownerCount || '?'} owners` : ''}
 ${context.dealerConcessions.length > 0 ? `Dealer has agreed to: ${context.dealerConcessions.join(', ')}` : ''}
-Listing Issues/Concerns: ${context.listing.redFlags?.join(', ') || 'None identified'}
 `.trim();
 
   // Build conversation history
   const historyStr = context.conversationHistory.length > 0
     ? context.conversationHistory
+        .slice(-6) // Only include last 6 exchanges for context
         .map(h => `${h.role.toUpperCase()}: ${h.message}`)
         .join('\n\n')
     : '(This is the start of price negotiation)';
@@ -154,7 +174,7 @@ Listing Issues/Concerns: ${context.listing.redFlags?.join(', ') || 'None identif
 
   try {
     const { stdout } = await execAsync(
-      `cat "${promptFile}" | claude --print --model sonnet`,  // Use Sonnet for nuanced negotiation
+      `cat "${promptFile}" | claude --print --model sonnet`,
       { timeout: 120000, maxBuffer: 1024 * 1024 }
     );
 
@@ -170,9 +190,9 @@ Listing Issues/Concerns: ${context.listing.redFlags?.join(', ') || 'None identif
   } catch (error) {
     // Fallback response
     return {
-      message: `Thank you for your response about the ${vehicle}. I'm still very interested, but I need to consider my options carefully. What's the best you can do on the price?`,
-      tactic: 'calibrated_question',
-      reasoning: 'Fallback response - keeps negotiation open',
+      message: `Thanks for getting back to me on the ${vehicle}. I'm still interested but need to consider my options. What's the best you can do on the price?`,
+      tactic: 'open_question',
+      reasoning: 'Fallback response - keeps negotiation open without committing',
       shouldEscalateToHuman: false,
     };
   } finally {
@@ -191,35 +211,37 @@ export async function generateOpeningOffer(
   const vehicle = `${context.listing.year} ${context.listing.make} ${context.listing.model}`;
   const listedPrice = context.listing.price || 0;
 
-  // Calculate opening offer (typically 15-25% below listed)
-  // Use a precise number for credibility
-  const discount = 0.20; // 20% below listed
+  // Calculate opening offer (10-15% below listed for email - more reasonable than in-person lowball)
+  const discount = 0.12; // 12% below listed
   const rawOffer = listedPrice * (1 - discount);
-  // Make it a precise-looking number
-  const openingOffer = Math.round(rawOffer / 50) * 50 + 47; // e.g., $10,347 instead of $10,000
+  // Make it a precise-looking number (suggests calculation, not arbitrary)
+  const openingOffer = Math.round(rawOffer / 25) * 25 + 50; // e.g., $11,450 instead of $11,000
 
-  const prompt = `You're starting a price negotiation for a ${vehicle} listed at $${listedPrice.toLocaleString()}.
+  const prompt = `You're writing an opening price negotiation email for a ${vehicle} listed at $${listedPrice.toLocaleString()}.
 
-Your target price is $${context.targetPrice.toLocaleString()} and you'll walk away above $${context.walkAwayPrice.toLocaleString()}.
+Your target price is $${context.targetPrice.toLocaleString()} and you'll walk away above $${context.walkAwayPrice.toLocaleString()} (don't reveal this).
 
-${context.listing.redFlags?.length ? `Known issues with this vehicle: ${context.listing.redFlags.join(', ')}` : ''}
+Seller type: ${context.listing.sellerType || 'Unknown'}
 
-${context.marketData ? `Market data shows average price is $${context.marketData.averagePrice.toLocaleString()} with ${context.marketData.comparableListings} comparable listings.` : ''}
+${context.listing.redFlags?.length ? `Vehicle concerns to reference: ${context.listing.redFlags.join('; ')}` : 'No specific concerns identified yet.'}
 
-Generate an opening message that:
-1. Thanks them for previous communication
-2. Expresses continued interest
-3. Uses an accusation audit ("You're probably going to think...")
-4. Makes a precise opening offer around $${openingOffer.toLocaleString()}
-5. Justifies with objective criteria (market data, vehicle age, issues found, etc.)
-6. Asks a calibrated question
+${context.marketData ? `Market data: Average is $${context.marketData.averagePrice.toLocaleString()} with ${context.marketData.comparableListings} similar listings. Lowest comparable is $${context.marketData.lowestPrice.toLocaleString()}.` : 'No market data available - focus on vehicle-specific factors.'}
 
-Keep it professional and concise. This is via email/text.
+${context.listing.carfaxReceived ? `CARFAX shows: ${context.listing.accidentCount || 0} accidents, ${context.listing.ownerCount || '?'} owners, ${context.listing.serviceRecordCount || '?'} service records.` : ''}
+
+Write a brief opening negotiation email that:
+1. References previous communication briefly
+2. Makes a specific offer around $${openingOffer.toLocaleString()}
+3. Justifies with 1-2 concrete reasons (market data, vehicle concerns, or both)
+4. Keeps it SHORT (4-6 sentences total)
+5. Ends with an open question
+
+This is a real email to send - keep it natural and professional, not salesy or manipulative.
 
 Output JSON:
 {
-  "message": "Your opening negotiation message",
-  "tactic": "accusation_audit, precise_number, calibrated_question",
+  "message": "Your email text",
+  "tactic": "Brief tactic description",
   "reasoning": "Why this approach",
   "suggestedOffer": ${openingOffer},
   "shouldEscalateToHuman": false,
@@ -243,19 +265,17 @@ Output JSON:
     return JSON.parse(jsonMatch[0]) as NegotiationResponse;
 
   } catch (error) {
-    // Fallback opener
+    // Fallback opener - simple and direct
+    const concerns = context.listing.redFlags?.slice(0, 2).join(' and ') || 'some factors';
+
     return {
       message: `Hi,
 
-Thank you for the information about the ${vehicle}. I'm very interested in this vehicle for my family.
+Thanks for the info on the ${vehicle}. I'm interested but after reviewing the market and considering ${concerns}, I'd like to offer $${openingOffer.toLocaleString()}.
 
-I've done some research on comparable ${context.listing.year} ${context.listing.model}s in the area, and I was hoping we could discuss the price. You're probably going to think I'm being a tough negotiator here, but based on the market data I've seen, would you consider $${openingOffer.toLocaleString()}?
-
-I understand if that's not where you need to be - what would it take to make this work for both of us?
-
-Thanks,`,
-      tactic: 'accusation_audit, precise_number, calibrated_question',
-      reasoning: 'Standard opening with key tactics',
+Would that work for you?`,
+      tactic: 'direct_offer_with_justification',
+      reasoning: 'Simple opening - states offer with brief justification',
       suggestedOffer: openingOffer,
       shouldEscalateToHuman: false,
     };
@@ -277,16 +297,16 @@ export function shouldAcceptOffer(
   if (currentOffer <= context.targetPrice) {
     return {
       accept: true,
-      reason: `Offer $${currentOffer.toLocaleString()} is at or below target price $${context.targetPrice.toLocaleString()}`,
+      reason: `Offer $${currentOffer.toLocaleString()} meets target price $${context.targetPrice.toLocaleString()}`,
     };
   }
 
-  // Accept if close to target and we've been negotiating a while
+  // Accept if within 3% of target and we've had multiple exchanges
   const exchangeCount = context.conversationHistory.length;
-  if (currentOffer <= context.targetPrice * 1.05 && exchangeCount >= 4) {
+  if (currentOffer <= context.targetPrice * 1.03 && exchangeCount >= 4) {
     return {
       accept: true,
-      reason: `Offer $${currentOffer.toLocaleString()} is within 5% of target after ${exchangeCount} exchanges`,
+      reason: `Offer $${currentOffer.toLocaleString()} is within 3% of target after ${exchangeCount} exchanges`,
     };
   }
 
@@ -301,7 +321,7 @@ export function shouldAcceptOffer(
   // Continue negotiating
   return {
     accept: false,
-    reason: `Offer $${currentOffer.toLocaleString()} is above target $${context.targetPrice.toLocaleString()} - continue negotiating`,
+    reason: `Offer $${currentOffer.toLocaleString()} is above target $${context.targetPrice.toLocaleString()} - room to negotiate`,
   };
 }
 
@@ -315,21 +335,49 @@ export function calculateNegotiationPrices(
 ): { targetPrice: number; walkAwayPrice: number } {
   const listedPrice = listing.price || budget;
 
-  // Target: 15% below listed or market average, whichever is lower
-  const baseTarget = marketAverage
-    ? Math.min(listedPrice * 0.85, marketAverage * 0.95)
-    : listedPrice * 0.85;
+  // Target: 10-15% below listed, or below market average
+  let targetPrice: number;
+  if (marketAverage && marketAverage < listedPrice) {
+    // If market average is below listed, target 5% below market average
+    targetPrice = marketAverage * 0.95;
+  } else {
+    // Otherwise target 12% below listed
+    targetPrice = listedPrice * 0.88;
+  }
 
-  // Ensure target is realistic (not below 70% of listed)
-  const targetPrice = Math.max(baseTarget, listedPrice * 0.70);
+  // Ensure target is realistic (not below 75% of listed - would be insulting)
+  targetPrice = Math.max(targetPrice, listedPrice * 0.75);
 
-  // Walk-away: budget minus estimated fees, or 5% below listed, whichever is lower
-  const budgetBasedWalkAway = budget * 0.85; // Leave room for taxes/fees
-  const listedBasedWalkAway = listedPrice * 0.95;
-  const walkAwayPrice = Math.min(budgetBasedWalkAway, listedBasedWalkAway);
+  // Walk-away: budget minus estimated fees (~15% for taxes/fees/safety), or listed price
+  // We'll pay up to listed price if we have to, but not more
+  const budgetAfterFees = budget * 0.85;
+  const walkAwayPrice = Math.min(budgetAfterFees, listedPrice);
 
   return {
     targetPrice: Math.round(targetPrice),
     walkAwayPrice: Math.round(walkAwayPrice),
   };
+}
+
+/**
+ * Calculate next counter-offer based on negotiation progress
+ */
+export function calculateCounterOffer(context: NegotiationContext): number {
+  const ourLast = context.ourLastOffer || context.targetPrice;
+  const theirOffer = context.currentOffer || context.listing.price || ourLast;
+
+  // Gap between positions
+  const gap = theirOffer - ourLast;
+
+  // Move 20-30% of the gap, with smaller moves as we get closer
+  const exchangeCount = context.conversationHistory.length;
+  const movePercent = Math.max(0.15, 0.35 - (exchangeCount * 0.05)); // Decreases with each exchange
+
+  const rawCounter = ourLast + (gap * movePercent);
+
+  // Don't exceed walk-away
+  const counter = Math.min(rawCounter, context.walkAwayPrice);
+
+  // Make it a precise number
+  return Math.round(counter / 25) * 25 + (counter % 100 > 50 ? 75 : 25);
 }

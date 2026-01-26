@@ -11,6 +11,12 @@ import {
 } from '../../negotiation/negotiator.js';
 import { EmailClient } from '../../email/client.js';
 
+// Safety limits for auto-send mode
+const AUTO_SEND_DEFAULTS = {
+  maxExchanges: 6,        // Stop auto-negotiating after this many exchanges
+  maxOfferPercent: 0.95,  // Never offer more than 95% of walk-away price automatically
+};
+
 export const negotiateCommand = new Command('negotiate')
   .description('Start or continue price negotiation with a dealer')
   .argument('<id>', 'Listing ID')
@@ -19,6 +25,9 @@ export const negotiateCommand = new Command('negotiate')
   .option('--target <price>', 'Override target price')
   .option('--walkaway <price>', 'Override walk-away price')
   .option('--send', 'Send the generated message')
+  .option('--auto-send', 'Automatically send without confirmation (use with caution)')
+  .option('--max-offer <price>', 'Maximum offer for auto-send mode (safety limit)')
+  .option('--max-exchanges <n>', 'Maximum exchanges before stopping auto-send', String(AUTO_SEND_DEFAULTS.maxExchanges))
   .option('--email <email>', 'Override dealer email')
   .action(async (id, options) => {
     try {
@@ -164,6 +173,37 @@ export const negotiateCommand = new Command('negotiate')
         console.log(`\n⚠️  HUMAN ATTENTION NEEDED: ${response.escalationReason}`);
       }
 
+      // Auto-send safety checks
+      let autoSendBlocked = false;
+      let blockReason = '';
+
+      if (options.autoSend) {
+        const maxExchanges = parseInt(options.maxExchanges, 10) || AUTO_SEND_DEFAULTS.maxExchanges;
+        const maxOffer = options.maxOffer
+          ? parseInt(options.maxOffer, 10)
+          : Math.round(finalWalkAway * AUTO_SEND_DEFAULTS.maxOfferPercent);
+
+        // Check safety conditions
+        if (response.shouldEscalateToHuman) {
+          autoSendBlocked = true;
+          blockReason = `AI requested human attention: ${response.escalationReason}`;
+        } else if (context.conversationHistory.length >= maxExchanges) {
+          autoSendBlocked = true;
+          blockReason = `Reached max exchanges limit (${maxExchanges})`;
+        } else if (response.suggestedOffer && response.suggestedOffer > maxOffer) {
+          autoSendBlocked = true;
+          blockReason = `Suggested offer $${response.suggestedOffer.toLocaleString()} exceeds max-offer limit $${maxOffer.toLocaleString()}`;
+        } else if (context.stage === 'final' || context.stage === 'accepted') {
+          autoSendBlocked = true;
+          blockReason = `Negotiation reached ${context.stage} stage - human confirmation required`;
+        }
+
+        if (autoSendBlocked) {
+          console.log(`\n🛑 AUTO-SEND BLOCKED: ${blockReason}`);
+          console.log('   Run with --send to manually review and send.');
+        }
+      }
+
       // Save context to listing notes
       context.conversationHistory.push({
         role: 'buyer',
@@ -184,8 +224,10 @@ export const negotiateCommand = new Command('negotiate')
       });
       console.log('\n💾 Negotiation context saved.');
 
-      // Send if requested
-      if (options.send) {
+      // Send if requested (--send or --auto-send without block)
+      const shouldSend = options.send || (options.autoSend && !autoSendBlocked);
+
+      if (shouldSend) {
         const email = options.email || listing.sellerEmail;
 
         if (!email) {
@@ -201,17 +243,253 @@ export const negotiateCommand = new Command('negotiate')
         });
 
         console.log(`\n✅ Message sent! (ID: ${messageId})`);
+        if (options.autoSend) {
+          console.log('   (auto-send mode)');
+        }
         db.updateListing(listing.id, {
           lastContactedAt: new Date().toISOString(),
           contactAttempts: (listing.contactAttempts || 0) + 1,
         });
         emailClient.close();
-      } else {
+      } else if (!options.autoSend) {
         console.log('\nTo send this message, run again with --send flag.');
+        console.log('Or use --auto-send for automatic sending (with safety limits).');
       }
 
     } catch (error) {
       console.error('Negotiation failed:', error);
+      process.exit(1);
+    }
+  });
+
+export const autoNegotiateCommand = new Command('auto-negotiate')
+  .description('Automatically respond to dealer negotiation emails')
+  .option('--dry-run', 'Show what would be done without sending')
+  .option('--max-offer <price>', 'Maximum offer amount (safety limit)')
+  .option('--max-exchanges <n>', 'Maximum exchanges per listing', '6')
+  .action(async (options) => {
+    try {
+      const config = loadConfig();
+      const db = getDatabase();
+      const budget = config.search.priceMax || 18000;
+
+      console.log('\n🤖 Auto-Negotiate: Processing dealer responses...\n');
+
+      const emailClient = new EmailClient();
+      const emails = await emailClient.fetchNewEmails();
+
+      if (emails.length === 0) {
+        console.log('No new emails to process.');
+        emailClient.close();
+        return;
+      }
+
+      console.log(`Found ${emails.length} new email(s)\n`);
+
+      // Get listings that are in negotiation or contacted
+      const listings = db.listListings({ status: ['contacted', 'interesting'] as any, limit: 100 });
+      const maxExchanges = parseInt(options.maxExchanges, 10);
+
+      let processed = 0;
+      let sent = 0;
+      let blocked = 0;
+
+      for (const email of emails) {
+        console.log('─'.repeat(60));
+        console.log(`From: ${email.from}`);
+        console.log(`Subject: ${email.subject}`);
+
+        // Match to listing
+        const matchedListing = listings.find(listing => {
+          if (listing.sellerEmail && email.from.includes(listing.sellerEmail)) return true;
+          if (listing.sellerName && email.from.toLowerCase().includes(listing.sellerName.toLowerCase())) return true;
+          const vehicle = `${listing.make} ${listing.model}`.toLowerCase();
+          if (email.subject.toLowerCase().includes(vehicle)) return true;
+          return false;
+        });
+
+        if (!matchedListing) {
+          console.log('  ❓ No matching listing found');
+          continue;
+        }
+
+        const vehicle = `${matchedListing.year} ${matchedListing.make} ${matchedListing.model}`;
+        console.log(`  ✅ Matched: #${matchedListing.id} ${vehicle}`);
+        processed++;
+
+        // Load negotiation context
+        const { targetPrice, walkAwayPrice } = calculateNegotiationPrices(matchedListing, budget);
+        const maxOffer = options.maxOffer
+          ? parseInt(options.maxOffer, 10)
+          : Math.round(walkAwayPrice * AUTO_SEND_DEFAULTS.maxOfferPercent);
+
+        const context: NegotiationContext = {
+          listing: matchedListing,
+          targetPrice,
+          walkAwayPrice,
+          conversationHistory: [],
+          dealerConcessions: [],
+          stage: 'countering',
+        };
+
+        // Load existing context
+        if (matchedListing.notes) {
+          try {
+            const saved = JSON.parse(matchedListing.notes);
+            if (saved.conversationHistory) {
+              context.conversationHistory = saved.conversationHistory;
+              context.stage = saved.stage || 'countering';
+              context.currentOffer = saved.currentOffer;
+              context.ourLastOffer = saved.ourLastOffer;
+              context.dealerConcessions = saved.dealerConcessions || [];
+            }
+          } catch {}
+        }
+
+        // Check exchange limit
+        if (context.conversationHistory.length >= maxExchanges) {
+          console.log(`  🛑 Skipped: Max exchanges reached (${maxExchanges})`);
+          blocked++;
+          continue;
+        }
+
+        // Add dealer's message to history
+        context.conversationHistory.push({
+          role: 'seller',
+          message: email.text,
+          timestamp: new Date(),
+        });
+
+        // Check for price mention
+        const priceMatch = email.text.match(/\$?([\d,]+)/g);
+        if (priceMatch) {
+          const prices = priceMatch.map(p => parseInt(p.replace(/[$,]/g, ''), 10)).filter(p => p > 5000);
+          if (prices.length > 0) {
+            context.currentOffer = Math.min(...prices);
+            console.log(`  💵 Detected offer: $${context.currentOffer.toLocaleString()}`);
+
+            const acceptCheck = shouldAcceptOffer(context.currentOffer, context);
+            if (acceptCheck.accept) {
+              console.log(`  ✅ Acceptable offer! Human confirmation needed.`);
+              context.stage = 'final';
+              blocked++;
+
+              // Save context but don't auto-respond
+              db.updateListing(matchedListing.id, {
+                notes: JSON.stringify({
+                  conversationHistory: context.conversationHistory,
+                  stage: context.stage,
+                  currentOffer: context.currentOffer,
+                  ourLastOffer: context.ourLastOffer,
+                  dealerConcessions: context.dealerConcessions,
+                }, null, 2),
+              });
+              continue;
+            }
+          }
+        }
+
+        // Generate response
+        console.log('  🎯 Generating response...');
+        const response = await generateNegotiationResponse(context, email.text);
+
+        console.log(`  📋 Tactic: ${response.tactic}`);
+        if (response.suggestedOffer) {
+          console.log(`  💵 Counter-offer: $${response.suggestedOffer.toLocaleString()}`);
+        }
+
+        // Safety checks
+        let shouldBlock = false;
+        let blockReason = '';
+
+        if (response.shouldEscalateToHuman) {
+          shouldBlock = true;
+          blockReason = response.escalationReason || 'AI requested human review';
+        } else if (response.suggestedOffer && response.suggestedOffer > maxOffer) {
+          shouldBlock = true;
+          blockReason = `Offer exceeds max-offer limit ($${maxOffer.toLocaleString()})`;
+        } else if (context.stage === 'final') {
+          shouldBlock = true;
+          blockReason = 'Deal near completion - human confirmation needed';
+        }
+
+        if (shouldBlock) {
+          console.log(`  🛑 Blocked: ${blockReason}`);
+          blocked++;
+
+          // Save context
+          context.conversationHistory.push({
+            role: 'buyer',
+            message: `[DRAFT - NOT SENT]\n${response.message}`,
+            timestamp: new Date(),
+          });
+        } else if (!options.dryRun) {
+          // Send the response
+          const emailMatch = email.from.match(/<(.+)>/) || [null, email.from];
+          const replyTo = emailMatch[1];
+
+          await emailClient.send({
+            to: replyTo,
+            subject: `Re: ${email.subject}`,
+            text: response.message,
+          });
+
+          console.log(`  ✅ Response sent to ${replyTo}`);
+          sent++;
+
+          context.conversationHistory.push({
+            role: 'buyer',
+            message: response.message,
+            timestamp: new Date(),
+          });
+
+          if (response.suggestedOffer) {
+            context.ourLastOffer = response.suggestedOffer;
+          }
+
+          db.updateListing(matchedListing.id, {
+            lastContactedAt: new Date().toISOString(),
+            contactAttempts: (matchedListing.contactAttempts || 0) + 1,
+          });
+        } else {
+          console.log('  [DRY RUN] Would send response');
+          context.conversationHistory.push({
+            role: 'buyer',
+            message: response.message,
+            timestamp: new Date(),
+          });
+        }
+
+        // Save updated context
+        db.updateListing(matchedListing.id, {
+          notes: JSON.stringify({
+            conversationHistory: context.conversationHistory,
+            stage: context.stage,
+            currentOffer: context.currentOffer,
+            ourLastOffer: context.ourLastOffer,
+            dealerConcessions: context.dealerConcessions,
+          }, null, 2),
+        });
+      }
+
+      emailClient.close();
+
+      console.log('\n' + '═'.repeat(60));
+      console.log('📊 Auto-Negotiate Summary');
+      console.log(`  Emails processed: ${processed}`);
+      console.log(`  Responses sent: ${sent}`);
+      console.log(`  Blocked (need human): ${blocked}`);
+
+      if (blocked > 0) {
+        console.log('\n⚠️  Some negotiations need human attention.');
+        console.log('   Run `npm run dev -- negotiation-status` to review.');
+      }
+
+      if (options.dryRun) {
+        console.log('\n[DRY RUN - No emails sent]');
+      }
+    } catch (error) {
+      console.error('Auto-negotiate failed:', error);
       process.exit(1);
     }
   });
