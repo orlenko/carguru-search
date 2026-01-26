@@ -14,6 +14,9 @@ config/config.local.yaml
 # All scraped data (listings, reports, photos)
 data/
 
+# Batch exports (contain listing details)
+export/
+
 # Playwright
 playwright-report/
 test-results/
