@@ -187,23 +187,15 @@ export class WebFormContact {
     }
 
     // Email field - REQUIRED
-    const emailSelectors = [
-      'input[type="email"]',
-      'input[name*="email" i]',
-      'input[name*="Email"]',
-      'input[placeholder*="email" i]',
-      'input[placeholder*="Email"]',
-      'input[id*="email" i]',
-      'input[autocomplete="email"]',
-      '[data-testid*="email"] input',
-      'input[aria-label*="email" i]',
-    ];
+    // Use direct input enumeration since page.$() selectors don't reliably find AutoTrader's SPA fields
     let emailFilled = false;
-    for (const selector of emailSelectors) {
+    const allInputs = await page.$$('input');
+    for (const input of allInputs) {
       try {
-        const field = await page.$(selector);
-        if (field && await field.isVisible()) {
-          await field.fill(formData.email);
+        if (!await input.isVisible()) continue;
+        const type = await input.getAttribute('type');
+        if (type === 'email') {
+          await input.fill(formData.email);
           console.log(`  Filled email: ${formData.email}`);
           emailFilled = true;
           break;
@@ -212,37 +204,54 @@ export class WebFormContact {
         continue;
       }
     }
+
+    // Fallback: try by name/placeholder if type="email" not found
+    if (!emailFilled) {
+      for (const input of allInputs) {
+        try {
+          if (!await input.isVisible()) continue;
+          const name = (await input.getAttribute('name'))?.toLowerCase() || '';
+          const placeholder = (await input.getAttribute('placeholder'))?.toLowerCase() || '';
+          const ariaLabel = (await input.getAttribute('aria-label'))?.toLowerCase() || '';
+          if (name.includes('email') || placeholder.includes('email') || ariaLabel.includes('email')) {
+            await input.fill(formData.email);
+            console.log(`  Filled email (by name/placeholder): ${formData.email}`);
+            emailFilled = true;
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+
     if (!emailFilled) {
       console.log('  ⚠️ WARNING: Could not find email field!');
       // Debug: list all visible input fields
-      const allInputs = await page.$$('input:visible');
-      console.log(`  Debug: Found ${allInputs.length} visible input fields`);
-      for (const input of allInputs.slice(0, 5)) {
-        const type = await input.getAttribute('type');
-        const name = await input.getAttribute('name');
-        const placeholder = await input.getAttribute('placeholder');
-        console.log(`    - type="${type}" name="${name}" placeholder="${placeholder}"`);
+      console.log('  Debug: Visible input fields:');
+      for (const input of allInputs) {
+        try {
+          if (!await input.isVisible()) continue;
+          const type = await input.getAttribute('type');
+          const name = await input.getAttribute('name');
+          const placeholder = await input.getAttribute('placeholder');
+          console.log(`    - type="${type}" name="${name}" placeholder="${placeholder}"`);
+        } catch {
+          continue;
+        }
       }
     }
 
     // Phone field (optional but try to fill)
     let phoneFilled = false;
     if (formData.phone) {
-      const phoneSelectors = [
-        'input[type="tel"]',
-        'input[name*="phone" i]',
-        'input[name*="Phone"]',
-        'input[placeholder*="phone" i]',
-        'input[placeholder*="Phone"]',
-        'input[id*="phone" i]',
-        'input[autocomplete="tel"]',
-        '[data-testid*="phone"] input',
-      ];
-      for (const selector of phoneSelectors) {
+      // First try type="tel"
+      for (const input of allInputs) {
         try {
-          const field = await page.$(selector);
-          if (field && await field.isVisible()) {
-            await field.fill(formData.phone);
+          if (!await input.isVisible()) continue;
+          const type = await input.getAttribute('type');
+          if (type === 'tel') {
+            await input.fill(formData.phone);
             console.log(`  Filled phone: ${formData.phone}`);
             phoneFilled = true;
             break;
@@ -251,6 +260,26 @@ export class WebFormContact {
           continue;
         }
       }
+
+      // Fallback: try by name/placeholder
+      if (!phoneFilled) {
+        for (const input of allInputs) {
+          try {
+            if (!await input.isVisible()) continue;
+            const name = (await input.getAttribute('name'))?.toLowerCase() || '';
+            const placeholder = (await input.getAttribute('placeholder'))?.toLowerCase() || '';
+            if (name.includes('phone') || placeholder.includes('phone')) {
+              await input.fill(formData.phone);
+              console.log(`  Filled phone (by name/placeholder): ${formData.phone}`);
+              phoneFilled = true;
+              break;
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+
       if (!phoneFilled) {
         console.log('  Note: Could not find phone field (optional)');
       }

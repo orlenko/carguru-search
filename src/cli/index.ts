@@ -16,6 +16,7 @@ import { negotiateCommand, negotiationStatusCommand, autoNegotiateCommand } from
 import { triageCommand } from './commands/triage.js';
 import { exportCommand } from './commands/export.js';
 import { pipelineCommand } from './commands/pipeline.js';
+import { syncWorkspaceCommand, addEmailCommand, askClaudeCommand, analyzeEmailCommand } from './commands/workspace.js';
 
 const program = new Command();
 
@@ -61,5 +62,11 @@ program.addCommand(exportCommand);
 
 // Automation commands
 program.addCommand(pipelineCommand);
+
+// Workspace commands (Claude-powered analysis)
+program.addCommand(syncWorkspaceCommand);
+program.addCommand(addEmailCommand);
+program.addCommand(askClaudeCommand);
+program.addCommand(analyzeEmailCommand);
 
 program.parse();

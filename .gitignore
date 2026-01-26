@@ -17,6 +17,9 @@ data/
 # Batch exports (contain listing details)
 export/
 
+# Workspace listings (contain correspondence)
+workspace/listings/
+
 # Playwright
 playwright-report/
 test-results/
