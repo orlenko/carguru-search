@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS listings (
   -- Status tracking
   status TEXT DEFAULT 'new',         -- 'new', 'contacted', 'carfax_requested',
                                      -- 'carfax_received', 'analyzed', 'shortlisted',
-                                     -- 'rejected', 'viewing_scheduled', 'offer_made'
+                                     -- 'rejected', 'viewing_scheduled', 'offer_made', 'interesting'
+  infoStatus TEXT DEFAULT 'pending', -- 'pending', 'carfax_requested', 'carfax_received', 'ready'
+  exportedAt TEXT,                   -- ISO timestamp when exported to batch folder
 
   -- Analysis results
   score REAL,                        -- 0-100 composite score
@@ -63,6 +65,7 @@ CREATE TABLE IF NOT EXISTS listings (
 
   -- Notes
   notes TEXT,                        -- User notes
+  sellerConversation TEXT,           -- JSON array of conversation messages
 
   -- Timestamps
   discoveredAt TEXT DEFAULT (datetime('now')),
@@ -134,13 +137,53 @@ CREATE TABLE IF NOT EXISTS price_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_price_history_listing ON price_history(listingId);
+
+-- Email attachments table: track attachments from seller communications
+CREATE TABLE IF NOT EXISTS email_attachments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  listingId INTEGER NOT NULL,
+  emailId INTEGER,
+
+  -- Attachment details
+  filename TEXT NOT NULL,
+  originalFilename TEXT NOT NULL,
+  filePath TEXT NOT NULL,            -- Path in data/attachments/{listing_id}/
+  mimeType TEXT,
+  sizeBytes INTEGER,
+
+  -- Classification
+  attachmentType TEXT,               -- 'carfax', 'photo', 'document', 'other'
+  isRelevant INTEGER DEFAULT 1,      -- Boolean: false for signatures, logos, etc.
+
+  -- Timestamps
+  receivedAt TEXT DEFAULT (datetime('now')),
+
+  FOREIGN KEY (listingId) REFERENCES listings(id),
+  FOREIGN KEY (emailId) REFERENCES emails(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_attachments_listing ON email_attachments(listingId);
 `;
+
+/**
+ * Migrations for existing databases
+ * These are run after the main schema to add new columns to existing tables
+ */
+export const MIGRATIONS = [
+  // Add infoStatus column if it doesn't exist
+  `ALTER TABLE listings ADD COLUMN infoStatus TEXT DEFAULT 'pending'`,
+  // Add exportedAt column if it doesn't exist
+  `ALTER TABLE listings ADD COLUMN exportedAt TEXT`,
+  // Add sellerConversation column if it doesn't exist
+  `ALTER TABLE listings ADD COLUMN sellerConversation TEXT`,
+];
 
 /**
  * Status flow for listings
  */
 export const LISTING_STATUSES = [
   'new',              // Just discovered
+  'interesting',      // Triaged as worth pursuing
   'contacted',        // Initial contact made
   'carfax_requested', // CARFAX report requested
   'carfax_received',  // CARFAX received, pending analysis
@@ -150,5 +193,14 @@ export const LISTING_STATUSES = [
   'viewing_scheduled',// In-person viewing scheduled
   'offer_made',       // Offer submitted
 ] as const;
+
+export const INFO_STATUSES = [
+  'pending',          // No info collected yet
+  'carfax_requested', // CARFAX requested but not received
+  'carfax_received',  // CARFAX received
+  'ready',            // All info collected, ready for export
+] as const;
+
+export type InfoStatus = typeof INFO_STATUSES[number];
 
 export type ListingStatus = typeof LISTING_STATUSES[number];

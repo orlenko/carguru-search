@@ -13,6 +13,8 @@ import { respondCommand, draftCommand } from './commands/respond.js';
 import { checkVoicemailCommand, voicemailTwimlCommand } from './commands/voicemail.js';
 import { outreachCommand, inboxCommand, autoRespondCommand } from './commands/outreach.js';
 import { negotiateCommand, negotiationStatusCommand } from './commands/negotiate.js';
+import { triageCommand } from './commands/triage.js';
+import { exportCommand } from './commands/export.js';
 
 const program = new Command();
 
@@ -50,5 +52,9 @@ program.addCommand(autoRespondCommand);
 // Negotiation commands
 program.addCommand(negotiateCommand);
 program.addCommand(negotiationStatusCommand);
+
+// Batch workflow commands
+program.addCommand(triageCommand);
+program.addCommand(exportCommand);
 
 program.parse();

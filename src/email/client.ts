@@ -2,6 +2,9 @@ import Imap from 'imap';
 import { simpleParser, ParsedMail } from 'mailparser';
 import nodemailer from 'nodemailer';
 import { getEnv } from '../config.js';
+import * as fs from 'fs';
+import * as path from 'path';
+import { getDatabase, type NewEmailAttachment } from '../database/index.js';
 
 export interface EmailConfig {
   user: string;
@@ -310,4 +313,171 @@ export class EmailClient {
       this.transporter = null;
     }
   }
+}
+
+/**
+ * Attachment type classification based on filename and content type
+ */
+export type AttachmentType = 'carfax' | 'photo' | 'document' | 'other';
+
+/**
+ * Check if an attachment is likely irrelevant (signature, logo, marketing)
+ */
+export function isIrrelevantAttachment(filename: string, contentType: string, sizeBytes: number): boolean {
+  const lowerFilename = filename.toLowerCase();
+
+  // Skip very small images (likely signatures/logos)
+  if (contentType.startsWith('image/') && sizeBytes < 10000) {
+    return true;
+  }
+
+  // Skip common signature/logo patterns
+  const irrelevantPatterns = [
+    'signature',
+    'logo',
+    'banner',
+    'footer',
+    'header',
+    'spacer',
+    'pixel',
+    'tracking',
+    'unsubscribe',
+    'email_sig',
+    'emailsig',
+    'sig_',
+    '_sig',
+    'icon',
+  ];
+
+  for (const pattern of irrelevantPatterns) {
+    if (lowerFilename.includes(pattern)) {
+      return true;
+    }
+  }
+
+  // Skip marketing image dimensions patterns (e.g., 600x100.png)
+  if (/\d+x\d+\.(png|jpg|gif)$/i.test(lowerFilename)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Classify attachment type based on filename and content type
+ */
+export function classifyAttachment(filename: string, contentType: string): AttachmentType {
+  const lowerFilename = filename.toLowerCase();
+
+  // CARFAX detection
+  if (lowerFilename.includes('carfax') || lowerFilename.includes('car_fax') || lowerFilename.includes('vehicle_history')) {
+    return 'carfax';
+  }
+
+  // PDF documents
+  if (contentType === 'application/pdf' || lowerFilename.endsWith('.pdf')) {
+    // Could be CARFAX, inspection report, etc.
+    if (lowerFilename.includes('report') || lowerFilename.includes('inspection') || lowerFilename.includes('history')) {
+      return 'document';
+    }
+    return 'document';
+  }
+
+  // Images
+  if (contentType.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|heic)$/i.test(lowerFilename)) {
+    return 'photo';
+  }
+
+  // Other document types
+  if (/\.(doc|docx|xls|xlsx|txt)$/i.test(lowerFilename)) {
+    return 'document';
+  }
+
+  return 'other';
+}
+
+/**
+ * Save attachments from an email to disk and record in database
+ */
+export async function saveEmailAttachments(
+  email: IncomingEmail,
+  listingId: number,
+  emailId?: number
+): Promise<Array<{ filename: string; path: string; type: AttachmentType }>> {
+  const db = getDatabase();
+  const savedAttachments: Array<{ filename: string; path: string; type: AttachmentType }> = [];
+
+  if (!email.attachments || email.attachments.length === 0) {
+    return savedAttachments;
+  }
+
+  // Create attachments directory
+  const attachmentsDir = path.join('data', 'attachments', listingId.toString());
+  fs.mkdirSync(attachmentsDir, { recursive: true });
+
+  for (const attachment of email.attachments) {
+    const sizeBytes = attachment.content.length;
+    const isRelevant = !isIrrelevantAttachment(attachment.filename, attachment.contentType, sizeBytes);
+
+    if (!isRelevant) {
+      continue; // Skip irrelevant attachments
+    }
+
+    const attachmentType = classifyAttachment(attachment.filename, attachment.contentType);
+
+    // Generate unique filename to avoid conflicts
+    let filename = attachment.filename;
+    let filePath = path.join(attachmentsDir, filename);
+    let counter = 1;
+
+    while (fs.existsSync(filePath)) {
+      const ext = path.extname(filename);
+      const base = path.basename(filename, ext);
+      filename = `${base}_${counter}${ext}`;
+      filePath = path.join(attachmentsDir, filename);
+      counter++;
+    }
+
+    // Save file to disk
+    fs.writeFileSync(filePath, attachment.content);
+
+    // Record in database
+    const newAttachment: NewEmailAttachment = {
+      listingId,
+      emailId,
+      filename,
+      originalFilename: attachment.filename,
+      filePath,
+      mimeType: attachment.contentType,
+      sizeBytes,
+      attachmentType,
+      isRelevant: true,
+    };
+
+    db.saveAttachment(newAttachment);
+
+    savedAttachments.push({
+      filename,
+      path: filePath,
+      type: attachmentType,
+    });
+  }
+
+  return savedAttachments;
+}
+
+/**
+ * Extract seller contact from email for matching with listings
+ */
+export function extractSenderEmail(email: IncomingEmail): string | null {
+  // Extract email address from "Name <email@example.com>" format
+  const match = email.from.match(/<([^>]+)>/);
+  if (match) {
+    return match[1].toLowerCase();
+  }
+  // If no angle brackets, assume it's just an email
+  if (email.from.includes('@')) {
+    return email.from.toLowerCase().trim();
+  }
+  return null;
 }

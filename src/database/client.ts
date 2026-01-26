@@ -1,6 +1,41 @@
 import Database from 'better-sqlite3';
-import { SCHEMA, type ListingStatus } from './schema.js';
+import { SCHEMA, MIGRATIONS, type ListingStatus, type InfoStatus } from './schema.js';
 import path from 'path';
+
+export interface ConversationMessage {
+  date: string;
+  direction: 'outbound' | 'inbound';
+  channel: 'email' | 'sms' | 'phone';
+  subject?: string;
+  body: string;
+  attachments?: string[];
+}
+
+export interface EmailAttachment {
+  id: number;
+  listingId: number;
+  emailId: number | null;
+  filename: string;
+  originalFilename: string;
+  filePath: string;
+  mimeType: string | null;
+  sizeBytes: number | null;
+  attachmentType: 'carfax' | 'photo' | 'document' | 'other' | null;
+  isRelevant: boolean;
+  receivedAt: string;
+}
+
+export interface NewEmailAttachment {
+  listingId: number;
+  emailId?: number;
+  filename: string;
+  originalFilename: string;
+  filePath: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  attachmentType?: 'carfax' | 'photo' | 'document' | 'other';
+  isRelevant?: boolean;
+}
 
 export interface Listing {
   id: number;
@@ -27,6 +62,8 @@ export interface Listing {
   features: string[] | null;
   photoUrls: string[] | null;
   status: ListingStatus;
+  infoStatus: InfoStatus;
+  exportedAt: string | null;
   score: number | null;
   redFlags: string[] | null;
   aiAnalysis: string | null;
@@ -39,6 +76,7 @@ export interface Listing {
   lastContactedAt: string | null;
   contactAttempts: number;
   notes: string | null;
+  sellerConversation: ConversationMessage[] | null;
   discoveredAt: string;
   updatedAt: string;
 }
@@ -80,6 +118,22 @@ export class DatabaseClient {
 
   private initialize(): void {
     this.db.exec(SCHEMA);
+    this.runMigrations();
+  }
+
+  private runMigrations(): void {
+    // Run each migration, ignoring errors for already-applied migrations
+    for (const migration of MIGRATIONS) {
+      try {
+        this.db.exec(migration);
+      } catch (err) {
+        // Ignore "duplicate column name" errors - migration already applied
+        const message = err instanceof Error ? err.message : String(err);
+        if (!message.includes('duplicate column name')) {
+          console.error('Migration error:', message);
+        }
+      }
+    }
   }
 
   /**
@@ -206,10 +260,11 @@ export class DatabaseClient {
    */
   updateListing(id: number, updates: Partial<Omit<Listing, 'id' | 'discoveredAt'>>): void {
     const allowedFields = [
-      'status', 'score', 'redFlags', 'aiAnalysis', 'carfaxReceived', 'carfaxPath',
-      'accidentCount', 'ownerCount', 'serviceRecordCount', 'carfaxSummary',
-      'lastContactedAt', 'contactAttempts', 'notes', 'vin', 'price', 'mileageKm',
-      'sellerPhone', 'sellerEmail',
+      'status', 'infoStatus', 'exportedAt', 'score', 'redFlags', 'aiAnalysis',
+      'carfaxReceived', 'carfaxPath', 'accidentCount', 'ownerCount',
+      'serviceRecordCount', 'carfaxSummary', 'lastContactedAt', 'contactAttempts',
+      'notes', 'sellerConversation', 'vin', 'price', 'mileageKm', 'sellerPhone',
+      'sellerEmail',
     ];
 
     const fieldsToUpdate: string[] = [];
@@ -218,7 +273,7 @@ export class DatabaseClient {
     for (const [key, value] of Object.entries(updates)) {
       if (allowedFields.includes(key)) {
         fieldsToUpdate.push(`${key} = ?`);
-        if (key === 'redFlags' && Array.isArray(value)) {
+        if ((key === 'redFlags' || key === 'sellerConversation') && Array.isArray(value)) {
           values.push(JSON.stringify(value));
         } else if (key === 'carfaxReceived') {
           values.push(value ? 1 : 0);
@@ -319,8 +374,122 @@ export class DatabaseClient {
       features: row.features ? JSON.parse(row.features as string) : null,
       photoUrls: row.photoUrls ? JSON.parse(row.photoUrls as string) : null,
       redFlags: row.redFlags ? JSON.parse(row.redFlags as string) : null,
+      sellerConversation: row.sellerConversation ? JSON.parse(row.sellerConversation as string) : null,
       carfaxReceived: Boolean(row.carfaxReceived),
+      infoStatus: (row.infoStatus as InfoStatus) || 'pending',
     } as Listing;
+  }
+
+  /**
+   * Save an email attachment record
+   */
+  saveAttachment(attachment: NewEmailAttachment): number {
+    const result = this.db.prepare(`
+      INSERT INTO email_attachments (
+        listingId, emailId, filename, originalFilename, filePath,
+        mimeType, sizeBytes, attachmentType, isRelevant
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id
+    `).get(
+      attachment.listingId,
+      attachment.emailId || null,
+      attachment.filename,
+      attachment.originalFilename,
+      attachment.filePath,
+      attachment.mimeType || null,
+      attachment.sizeBytes || null,
+      attachment.attachmentType || null,
+      attachment.isRelevant !== false ? 1 : 0
+    ) as { id: number };
+    return result.id;
+  }
+
+  /**
+   * Get attachments for a listing
+   */
+  getAttachments(listingId: number): EmailAttachment[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM email_attachments WHERE listingId = ? ORDER BY receivedAt DESC
+    `).all(listingId) as Array<Record<string, unknown>>;
+
+    return rows.map(row => ({
+      ...row,
+      isRelevant: Boolean(row.isRelevant),
+    })) as EmailAttachment[];
+  }
+
+  /**
+   * Get listings not yet exported (exportedAt is null)
+   */
+  getUnexportedListings(status?: ListingStatus | ListingStatus[]): Listing[] {
+    let sql = 'SELECT * FROM listings WHERE exportedAt IS NULL';
+    const params: unknown[] = [];
+
+    if (status) {
+      const statuses = Array.isArray(status) ? status : [status];
+      sql += ` AND status IN (${statuses.map(() => '?').join(', ')})`;
+      params.push(...statuses);
+    }
+
+    sql += ' ORDER BY discoveredAt DESC';
+
+    const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+    return rows.map(row => this.rowToListing(row));
+  }
+
+  /**
+   * Mark listings as exported
+   */
+  markExported(ids: number[]): void {
+    if (ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(', ');
+    this.db.prepare(`
+      UPDATE listings SET exportedAt = datetime('now'), updatedAt = datetime('now')
+      WHERE id IN (${placeholders})
+    `).run(...ids);
+  }
+
+  /**
+   * Get listings by specific IDs
+   */
+  getListingsByIds(ids: number[]): Listing[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT * FROM listings WHERE id IN (${placeholders})
+    `).all(...ids) as Record<string, unknown>[];
+    return rows.map(row => this.rowToListing(row));
+  }
+
+  /**
+   * Get emails for a listing
+   */
+  getEmailsForListing(listingId: number): Array<{
+    id: number;
+    direction: string;
+    subject: string | null;
+    body: string | null;
+    fromAddress: string | null;
+    toAddress: string | null;
+    status: string;
+    attachments: string | null;
+    createdAt: string;
+    sentAt: string | null;
+  }> {
+    return this.db.prepare(`
+      SELECT * FROM emails WHERE listingId = ? ORDER BY createdAt ASC
+    `).all(listingId) as Array<{
+      id: number;
+      direction: string;
+      subject: string | null;
+      body: string | null;
+      fromAddress: string | null;
+      toAddress: string | null;
+      status: string;
+      attachments: string | null;
+      createdAt: string;
+      sentAt: string | null;
+    }>;
   }
 
   close(): void {
