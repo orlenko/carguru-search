@@ -237,53 +237,86 @@ export class WebFormContact {
       }
     }
 
-    // Uncheck "Get price alerts" checkbox to avoid spam
-    // Modern UIs use custom checkboxes - find labels/containers and click them
-    const spamPatterns = ['price alert', 'similar listing', 'newsletter', 'subscribe', 'marketing', 'get alert'];
+    // Uncheck all marketing/spam checkboxes aggressively
+    // AutoTrader and other sites often have pre-checked newsletter/alert options
+    console.log('  Checking for spam/marketing checkboxes...');
 
-    // Method 1: Find labels with spam-related text
-    const allLabels = await page.$$('label');
-    for (const label of allLabels) {
-      try {
-        const text = (await label.textContent())?.toLowerCase() || '';
-        const visible = await label.isVisible();
-        if (!visible) continue;
+    const spamPatterns = [
+      'price alert', 'similar listing', 'newsletter', 'subscribe',
+      'marketing', 'get alert', 'email me', 'notify me', 'send me',
+      'keep me', 'stay updated', 'updates about'
+    ];
 
-        const isSpamCheckbox = spamPatterns.some(pattern => text.includes(pattern));
-        if (isSpamCheckbox) {
-          // Check if there's a checked checkbox inside or associated
-          const checkbox = await label.$('input[type="checkbox"]');
-          if (checkbox) {
-            const isChecked = await checkbox.isChecked();
-            if (isChecked) {
-              await label.click();
-              console.log('  Unchecked via label: ' + text.trim().slice(0, 50));
-            }
+    // Method 1: Find ALL checked checkboxes and uncheck if near spam-related text
+    try {
+      const allCheckboxes = await page.$$('input[type="checkbox"]');
+      for (const checkbox of allCheckboxes) {
+        try {
+          const isChecked = await checkbox.isChecked();
+          if (!isChecked) continue;
+
+          // Get surrounding text to check if it's spam-related
+          const surroundingText = await checkbox.evaluate(el => {
+            const label = el.closest('label') || el.parentElement;
+            return (label?.textContent || '').toLowerCase();
+          });
+
+          const isSpam = spamPatterns.some(p => surroundingText.includes(p));
+          if (isSpam) {
+            await checkbox.uncheck();
+            console.log('  ✓ Unchecked spam checkbox: ' + surroundingText.trim().slice(0, 40));
           }
+        } catch {
+          continue;
         }
-      } catch {
-        continue;
       }
+    } catch (e) {
+      // Ignore checkbox errors
     }
 
-    // Method 2: Find any element with spam-related text that looks clickable
+    // Method 2: Find labels with spam text and uncheck their checkboxes
+    try {
+      const allLabels = await page.$$('label');
+      for (const label of allLabels) {
+        try {
+          const text = (await label.textContent())?.toLowerCase() || '';
+          if (!await label.isVisible()) continue;
+
+          const isSpam = spamPatterns.some(p => text.includes(p));
+          if (isSpam) {
+            const checkbox = await label.$('input[type="checkbox"]');
+            if (checkbox && await checkbox.isChecked()) {
+              // Try direct uncheck first, then click label as fallback
+              try {
+                await checkbox.uncheck();
+              } catch {
+                await label.click();
+              }
+              console.log('  ✓ Unchecked via label: ' + text.trim().slice(0, 40));
+            }
+          }
+        } catch {
+          continue;
+        }
+      }
+    } catch (e) {
+      // Ignore label errors
+    }
+
+    // Method 3: Use Playwright's locator to find and uncheck any remaining checked spam checkboxes
     for (const pattern of spamPatterns) {
       try {
-        const element = await page.$(`text=${pattern}`);
-        if (element && await element.isVisible()) {
-          // Find nearby checkbox
-          const parent = await element.evaluateHandle(el => el.closest('label') || el.parentElement);
-          const checkbox = await (parent as any).$('input[type="checkbox"]');
-          if (checkbox) {
-            const isChecked = await checkbox.isChecked();
-            if (isChecked) {
-              await (parent as any).click();
-              console.log('  Unchecked via text: ' + pattern);
-            }
+        const locator = page.locator(`text=${pattern}`).locator('xpath=ancestor::label//input[type="checkbox"]');
+        const count = await locator.count();
+        for (let i = 0; i < count; i++) {
+          const checkbox = locator.nth(i);
+          if (await checkbox.isChecked()) {
+            await checkbox.uncheck({ force: true });
+            console.log(`  ✓ Unchecked via locator: ${pattern}`);
           }
         }
       } catch {
-        continue;
+        // Pattern not found or not a checkbox, continue
       }
     }
 

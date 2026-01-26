@@ -12,6 +12,68 @@ import type { Listing } from '../../database/client.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
+/**
+ * Check if an email should be skipped (automated, noreply, marketing, etc.)
+ */
+function shouldSkipEmail(email: { from: string; subject: string; text: string }): { skip: boolean; reason: string } {
+  const fromLower = email.from.toLowerCase();
+  const subjectLower = email.subject.toLowerCase();
+
+  // Skip noreply addresses
+  if (fromLower.includes('noreply') || fromLower.includes('no-reply') || fromLower.includes('donotreply')) {
+    return { skip: true, reason: 'noreply address' };
+  }
+
+  // Skip automated/system addresses
+  const automatedPatterns = [
+    'mailer-daemon',
+    'postmaster',
+    'autoresponder',
+    'auto-reply',
+    'automated',
+    'notification@',
+    'notifications@',
+    'alert@',
+    'alerts@',
+    'system@',
+    'admin@',
+    'support@',  // Usually automated ticket systems
+  ];
+  for (const pattern of automatedPatterns) {
+    if (fromLower.includes(pattern)) {
+      return { skip: true, reason: `automated address (${pattern})` };
+    }
+  }
+
+  // Skip marketing/newsletter subjects
+  const marketingSubjects = [
+    'subscription confirmed',
+    'you\'re subscribed',
+    'welcome to',
+    'thank you for signing up',
+    'price alert',
+    'price drop',
+    'similar vehicles',
+    'new listings',
+    'unsubscribe',
+    'weekly digest',
+    'daily digest',
+    'newsletter',
+  ];
+  for (const pattern of marketingSubjects) {
+    if (subjectLower.includes(pattern)) {
+      return { skip: true, reason: `marketing email (${pattern})` };
+    }
+  }
+
+  // Skip obvious confirmation emails
+  if (subjectLower.includes('confirmation') && !subjectLower.includes('viewing')) {
+    return { skip: true, reason: 'confirmation email' };
+  }
+
+  return { skip: false, reason: '' };
+}
+
 export const outreachCommand = new Command('outreach')
   .description('Automatically contact top-ranked listings')
   .option('-n, --limit <number>', 'Max listings to contact', '10')
@@ -268,6 +330,14 @@ export const autoRespondCommand = new Command('auto-respond')
         console.log('─'.repeat(60));
         console.log(`From: ${email.from}`);
         console.log(`Subject: ${email.subject}`);
+
+        // Check if we should skip this email (noreply, automated, marketing)
+        const skipCheck = shouldSkipEmail(email);
+        if (skipCheck.skip) {
+          console.log(`⏭️  Skipping: ${skipCheck.reason}`);
+          continue;
+        }
+
         console.log(`Preview: ${email.text.slice(0, 100)}...`);
 
         // Try to match email to a listing
