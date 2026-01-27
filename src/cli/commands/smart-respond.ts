@@ -214,84 +214,219 @@ function buildCrossListingContext(db: ReturnType<typeof getDatabase>): string {
 }
 
 /**
+ * Read previous emails from workspace
+ */
+function readEmailHistory(listingDir: string): string {
+  const emailsDir = path.join(listingDir, 'emails');
+  if (!fs.existsSync(emailsDir)) return 'No previous correspondence.';
+
+  const emailFiles = fs.readdirSync(emailsDir)
+    .filter(f => f.endsWith('.md'))
+    .sort();
+
+  if (emailFiles.length === 0) return 'No previous correspondence.';
+
+  const emails: string[] = [];
+  for (const file of emailFiles) {
+    const content = fs.readFileSync(path.join(emailsDir, file), 'utf-8');
+    emails.push(`### ${file}\n${content}`);
+  }
+
+  return emails.join('\n\n');
+}
+
+/**
+ * Read CARFAX summary if available
+ */
+function readCarfaxSummary(listingDir: string, listing: Listing): string {
+  // Try carfax-summary.md first
+  const summaryPath = path.join(listingDir, 'carfax-summary.md');
+  if (fs.existsSync(summaryPath)) {
+    return fs.readFileSync(summaryPath, 'utf-8');
+  }
+
+  // Fall back to database info
+  if (listing.carfaxSummary) {
+    return `## CARFAX Summary\n\n${listing.carfaxSummary}\n\n- Accidents: ${listing.accidentCount ?? 'Unknown'}\n- Owners: ${listing.ownerCount ?? 'Unknown'}\n- Service Records: ${listing.serviceRecordCount ?? 'Unknown'}`;
+  }
+
+  return 'CARFAX not yet received.';
+}
+
+/**
  * Invoke Claude to analyze email and get response
  */
 async function analyzeWithClaude(
   listing: Listing,
-  email: { from: string; subject: string; text: string },
+  email: { from: string; subject: string; text: string; date?: Date },
   crossListingContext: string,
-  listingDir: string
+  listingDir: string,
+  debug = false
 ): Promise<{ classification: string; action: string; response: string | null; reasoning: string }> {
   const vehicle = `${listing.year} ${listing.make} ${listing.model}`;
 
-  const prompt = `You are a car buying negotiator. Analyze this dealer email and respond with ONLY valid JSON.
+  if (debug) console.log('   [DEBUG] Building prompt with full context...');
 
-## Current Listing
-- **Vehicle:** ${vehicle}
-- **Asking Price:** $${listing.price?.toLocaleString()}
-- **Mileage:** ${listing.mileageKm?.toLocaleString()} km
-- **Seller:** ${listing.sellerName || 'Unknown'} (${listing.sellerType || 'unknown'})
-- **CARFAX Received:** ${listing.carfaxReceived ? 'Yes' : 'No'}
-- **Accidents:** ${listing.accidentCount ?? 'Unknown'}
-- **Listing Directory:** ${listingDir}
+  // Get current date/time for context
+  const now = new Date();
+  const currentDateTime = now.toLocaleString('en-CA', {
+    timeZone: 'America/Toronto',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  // Get email date
+  const emailDate = email.date
+    ? email.date.toLocaleString('en-CA', {
+        timeZone: 'America/Toronto',
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+    : 'Unknown date';
+
+  // Read listing details
+  const listingPath = path.join(listingDir, 'listing.md');
+  const listingDetails = fs.existsSync(listingPath)
+    ? fs.readFileSync(listingPath, 'utf-8')
+    : `Vehicle: ${vehicle}\nPrice: $${listing.price?.toLocaleString()}\nMileage: ${listing.mileageKm?.toLocaleString()} km`;
+
+  // Read email history
+  const emailHistory = readEmailHistory(listingDir);
+
+  // Read CARFAX
+  const carfaxInfo = readCarfaxSummary(listingDir, listing);
+
+  const prompt = `You are a car buying negotiator helping a buyer purchase a used minivan. Analyze the dealer's email and craft a strategic response.
+
+## IMPORTANT: Current Date/Time
+**Today is: ${currentDateTime}**
+
+When the dealer mentions relative times like "tomorrow", "this weekend", "next week", interpret them relative to WHEN THE EMAIL WAS SENT, not today. Then translate to actual dates in your response.
+
+---
+
+## Listing Details
+
+${listingDetails}
+
+---
+
+## CARFAX / Vehicle History
+
+${carfaxInfo}
+
+---
+
+## Previous Correspondence
+
+${emailHistory}
+
+---
+
+## Other Active Listings (for negotiation leverage)
 
 ${crossListingContext}
 
-## Email from Dealer
+---
 
+## NEW EMAIL TO ANALYZE
+
+**Received:** ${emailDate}
 **From:** ${email.from}
 **Subject:** ${email.subject}
 
+---
 ${email.text}
-
 ---
 
 ## Your Task
 
-Analyze this email and decide how to respond. Your goals:
-1. Get CARFAX if we don't have it
-2. Negotiate price down using market data and deficiencies
-3. Leverage other listings ("I'm also looking at a similar vehicle for $X less")
-4. Identify red flags that affect value
+Analyze this email considering the full context above. Your goals:
+1. Get CARFAX if we don't have it yet
+2. Negotiate price down using market data, vehicle deficiencies, and competing offers
+3. Leverage other listings when appropriate ("I'm also considering a similar vehicle listed at $X")
+4. Identify any red flags that affect value or trustworthiness
 5. Drive toward a purchase decision
 
 Respond with this exact JSON structure:
 {
   "classification": "available_with_carfax|available_no_carfax|sold|question|counter_offer|info_provided|follow_up|spam",
   "action": "request_carfax|make_offer|counter_offer|answer_question|schedule_viewing|mark_sold|ignore|needs_review",
-  "reasoning": "Brief explanation of your analysis and strategy",
-  "response": "The full email response to send, or null if no response needed. Keep it professional and concise. Sign as the buyer."
+  "reasoning": "Brief explanation of your analysis, noting any time-sensitive elements",
+  "response": "The full email response to send, or null if no response needed. Keep it professional and concise. Sign as 'Vlad'."
 }
 
 Important:
 - If car is sold, action should be "mark_sold" and response should be null
 - If spam/irrelevant, action should be "ignore" and response should be null
 - Always request CARFAX before negotiating price if we don't have it
-- Reference specific comparable listings when negotiating
+- Be specific about dates/times - convert relative times to actual dates
 - Be polite but firm on price`;
 
+  if (debug) console.log('   [DEBUG] Spawning Claude CLI with Opus model...');
+
   return new Promise((resolve, reject) => {
-    const claude = spawn('claude', ['-p', prompt, '--output-format', 'text'], {
+    // Use --print flag for non-interactive mode
+    // Use Opus model for best analysis quality
+    // Pass prompt via stdin to handle long prompts safely
+    const args = ['--print', '--model', 'opus'];
+
+    if (debug) console.log(`   [DEBUG] Prompt length: ${prompt.length} chars, using opus model, passing via stdin`);
+
+    const claude = spawn('claude', args, {
       cwd: process.cwd(),
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, NO_COLOR: '1' },
     });
+
+    // Write prompt to stdin and close it
+    if (claude.stdin) {
+      claude.stdin.write(prompt);
+      claude.stdin.end();
+    }
 
     let output = '';
     let errorOutput = '';
 
+    // Add timeout (60 seconds)
+    const timeout = setTimeout(() => {
+      claude.kill();
+      reject(new Error('Claude timed out after 60 seconds'));
+    }, 60000);
+
     claude.stdout?.on('data', (data) => {
-      output += data.toString();
+      const chunk = data.toString();
+      output += chunk;
+      if (debug) console.log(`   [DEBUG] stdout chunk: ${chunk.slice(0, 100)}...`);
     });
 
     claude.stderr?.on('data', (data) => {
-      errorOutput += data.toString();
+      const chunk = data.toString();
+      errorOutput += chunk;
+      if (debug) console.log(`   [DEBUG] stderr: ${chunk}`);
     });
 
     claude.on('error', (err) => {
+      clearTimeout(timeout);
       reject(new Error(`Failed to invoke Claude: ${err.message}`));
     });
 
     claude.on('exit', (code) => {
+      clearTimeout(timeout);
+
+      if (debug) {
+        console.log(`   [DEBUG] Claude exited with code ${code}`);
+        console.log(`   [DEBUG] Output length: ${output.length}`);
+      }
+
       if (code !== 0) {
         reject(new Error(`Claude exited with code ${code}: ${errorOutput}`));
         return;
@@ -309,6 +444,8 @@ Important:
             reasoning: result.reasoning || '',
           });
         } else {
+          console.log('   [WARN] No JSON in response, raw output:');
+          console.log(output.slice(0, 500));
           reject(new Error('No JSON found in Claude response'));
         }
       } catch (e) {
@@ -322,12 +459,14 @@ export const smartRespondCommand = new Command('smart-respond')
   .description('AI-powered automatic response to dealer emails')
   .option('--dry-run', 'Analyze emails but don\'t send responses')
   .option('--limit <n>', 'Max emails to process', '10')
+  .option('--debug', 'Enable debug logging')
   .action(async (options) => {
     try {
       const db = getDatabase();
       const emailClient = new EmailClient();
       const dryRun = options.dryRun ?? false;
       const limit = parseInt(options.limit);
+      const debug = options.debug ?? false;
 
       console.log('\n🤖 Smart Auto-Respond\n');
       console.log('Checking for new emails...');
@@ -425,7 +564,8 @@ export const smartRespondCommand = new Command('smart-respond')
             matchedListing,
             email,
             crossListingContext,
-            listingDir
+            listingDir,
+            debug
           );
 
           console.log(`   Classification: ${analysis.classification}`);
