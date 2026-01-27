@@ -261,6 +261,8 @@ async function analyzeWithClaude(
   email: { from: string; subject: string; text: string; date?: Date },
   crossListingContext: string,
   listingDir: string,
+  attachmentInfo: string,
+  carfaxJustReceived: boolean,
   debug = false
 ): Promise<{ classification: string; action: string; response: string | null; reasoning: string }> {
   const vehicle = `${listing.year} ${listing.make} ${listing.model}`;
@@ -301,8 +303,11 @@ async function analyzeWithClaude(
   // Read email history
   const emailHistory = readEmailHistory(listingDir);
 
-  // Read CARFAX
-  const carfaxInfo = readCarfaxSummary(listingDir, listing);
+  // Read CARFAX - note if just received
+  let carfaxInfo = readCarfaxSummary(listingDir, listing);
+  if (carfaxJustReceived) {
+    carfaxInfo = `**CARFAX/VEHICLE REPORT JUST RECEIVED WITH THIS EMAIL**\n\nThe report PDF has been saved. You should acknowledge receipt and proceed with negotiation.\n\n` + carfaxInfo;
+  }
 
   const prompt = `You are a car buying negotiator helping a buyer purchase a used minivan. Analyze the dealer's email and craft a strategic response.
 
@@ -342,7 +347,7 @@ ${crossListingContext}
 **Received:** ${emailDate}
 **From:** ${email.from}
 **Subject:** ${email.subject}
-
+${attachmentInfo}
 ---
 ${email.text}
 ---
@@ -536,19 +541,44 @@ export const smartRespondCommand = new Command('smart-respond')
         // Save inbound email to workspace
         saveEmailToWorkspace(listingDir, email, 'inbound');
 
-        // Check for CARFAX attachment first
-        const carfaxAttachment = email.attachments.find(
-          a => a.contentType === 'application/pdf' &&
-               (a.filename.toLowerCase().includes('carfax') ||
-                a.filename.toLowerCase().includes('history'))
+        // Check for attachments - list all PDFs, not just ones with "carfax" in name
+        const pdfAttachments = email.attachments.filter(
+          a => a.contentType === 'application/pdf'
         );
 
-        if (carfaxAttachment) {
-          console.log('📄 CARFAX detected - saving...');
+        // Build attachment info string for Claude
+        let attachmentInfo = '';
+        if (email.attachments.length > 0) {
+          attachmentInfo = '\n## Attachments in this email\n';
+          for (const att of email.attachments) {
+            attachmentInfo += `- ${att.filename} (${att.contentType})\n`;
+          }
+        }
+
+        // Check for CARFAX/vehicle report - be more inclusive with detection
+        const carfaxAttachment = pdfAttachments.find(
+          a => a.filename.toLowerCase().includes('carfax') ||
+               a.filename.toLowerCase().includes('history') ||
+               a.filename.toLowerCase().includes('report') ||
+               a.filename.toLowerCase().includes('vehicle')
+        );
+
+        // If no name match but there's a PDF and email mentions carfax/report, assume it's the report
+        const possibleCarfax = carfaxAttachment || (
+          pdfAttachments.length > 0 &&
+          (email.text.toLowerCase().includes('carfax') ||
+           email.text.toLowerCase().includes('report') ||
+           email.text.toLowerCase().includes('attached') ||
+           email.subject.toLowerCase().includes('report'))
+        ) ? pdfAttachments[0] : null;
+
+        let carfaxJustReceived = false;
+        if (possibleCarfax) {
+          console.log(`📄 Vehicle report detected: ${possibleCarfax.filename} - saving...`);
           const carfaxDir = path.join('data', 'carfax');
           fs.mkdirSync(carfaxDir, { recursive: true });
           const carfaxPath = path.join(carfaxDir, `listing-${matchedListing.id}.pdf`);
-          fs.writeFileSync(carfaxPath, carfaxAttachment.content);
+          fs.writeFileSync(carfaxPath, possibleCarfax.content);
           fs.copyFileSync(carfaxPath, path.join(listingDir, 'carfax.pdf'));
 
           db.updateListing(matchedListing.id, {
@@ -556,6 +586,12 @@ export const smartRespondCommand = new Command('smart-respond')
             carfaxPath,
           });
           console.log(`   Saved: ${carfaxPath}`);
+          carfaxJustReceived = true;
+
+          // Also write a note about receiving it
+          const carfaxNote = `\n## CARFAX/Vehicle Report\n\n**Just received with this email:** ${possibleCarfax.filename}\n\nThe PDF has been saved but not yet analyzed. Treat this as CARFAX received.`;
+          fs.writeFileSync(path.join(listingDir, 'carfax-received.md'), carfaxNote);
+          attachmentInfo += `\n**NOTE: Vehicle history report received and saved.**\n`;
         }
 
         // Invoke Claude for analysis
@@ -567,6 +603,8 @@ export const smartRespondCommand = new Command('smart-respond')
             email,
             crossListingContext,
             listingDir,
+            attachmentInfo,
+            carfaxJustReceived,
             debug
           );
 
