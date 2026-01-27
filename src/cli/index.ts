@@ -17,6 +17,7 @@ import { triageCommand } from './commands/triage.js';
 import { exportCommand } from './commands/export.js';
 import { pipelineCommand } from './commands/pipeline.js';
 import { syncWorkspaceCommand, addEmailCommand, askClaudeCommand, analyzeEmailCommand } from './commands/workspace.js';
+import { smartRespondCommand, recommendCommand } from './commands/smart-respond.js';
 
 const program = new Command();
 
@@ -68,5 +69,9 @@ program.addCommand(syncWorkspaceCommand);
 program.addCommand(addEmailCommand);
 program.addCommand(askClaudeCommand);
 program.addCommand(analyzeEmailCommand);
+
+// Smart AI-powered commands
+program.addCommand(smartRespondCommand);
+program.addCommand(recommendCommand);
 
 program.parse();
