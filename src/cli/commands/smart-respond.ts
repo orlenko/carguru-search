@@ -369,7 +369,9 @@ Important:
 - If spam/irrelevant, action should be "ignore" and response should be null
 - Always request CARFAX before negotiating price if we don't have it
 - Be specific about dates/times - convert relative times to actual dates
-- Be polite but firm on price`;
+- Be polite but firm on price
+- NEVER include a phone number in responses - only sign with name "Vlad"
+- Do NOT make up or hallucinate any contact information`;
 
   if (debug) console.log('   [DEBUG] Spawning Claude CLI with Opus model...');
 
