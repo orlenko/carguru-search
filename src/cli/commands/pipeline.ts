@@ -11,6 +11,7 @@ import { calculateTotalCost } from '../../pricing/calculator.js';
 import { WebFormContact, generateContactMessage } from '../../contact/web-form.js';
 import { EmailClient } from '../../email/client.js';
 import { generateEmail } from '../../email/templates.js';
+import { processEmailLinks, extractLinksFromEmail, filterRelevantLinks } from '../../email/link-processor.js';
 import { analyzeCarfaxBuffer } from '../../analyzers/carfax-analyzer.js';
 import { analyzeListingWithClaude } from '../../analyzers/listing-analyzer.js';
 import { AutoTraderScraper } from '../../scrapers/autotrader.js';
@@ -105,6 +106,7 @@ export const pipelineCommand = new Command('pipeline')
 
     const config = loadConfig();
     const db = getDatabase();
+    const budget = config.search.priceMax || 18000;
     const results = {
       searched: 0,
       newListings: 0,
@@ -112,6 +114,7 @@ export const pipelineCommand = new Command('pipeline')
       contacted: 0,
       emailsProcessed: 0,
       carfaxReceived: 0,
+      linksProcessed: 0,
     };
 
     // ═══════════════════════════════════════════════════════════════
@@ -177,7 +180,7 @@ export const pipelineCommand = new Command('pipeline')
       console.log('\n🔬 PHASE 2: ANALYZE\n');
       console.log('-'.repeat(40));
 
-      const unanalyzed = db.listListings({ status: 'new', limit: 100 })
+      const unanalyzed = db.listListings({ status: 'discovered', limit: 100 })
         .filter(l => !l.aiAnalysis);
 
       console.log(`Found ${unanalyzed.length} listings needing analysis\n`);
@@ -195,6 +198,30 @@ export const pipelineCommand = new Command('pipeline')
               redFlags: analysis.concerns,
               status: 'analyzed',
             });
+
+            // Calculate and persist cost breakdown
+            if (listing.price) {
+              const isDealer = listing.sellerType === 'dealer';
+              const cost = calculateTotalCost(listing.price, analysis?.pricing || null, budget, isDealer);
+              db.saveCostBreakdown(listing.id, {
+                askingPrice: listing.price,
+                estimatedFinalPrice: listing.price,
+                fees: {
+                  adminFee: isDealer ? 499 : 0,
+                  omvicFee: cost.omvicFee,
+                  tireStewardship: 20,
+                  dealerFees: cost.estimatedDealerFees,
+                  certification: cost.estimatedCertification,
+                },
+                taxRate: 0.13,
+                taxAmount: cost.hst,
+                registrationIncluded: true,
+                registrationCost: cost.licensing,
+                totalEstimatedCost: cost.totalCost,
+                budget,
+              });
+            }
+
             results.analyzed++;
             console.log(` ✅ Score: ${analysis.recommendationScore}`);
           } catch (error) {
@@ -208,6 +235,47 @@ export const pipelineCommand = new Command('pipeline')
       } else if (options.dryRun) {
         console.log(`[DRY RUN] Would analyze ${unanalyzed.length} listings`);
       }
+
+      // Also calculate costs for analyzed listings missing cost breakdowns
+      if (!options.dryRun) {
+        const analyzedListings = db.listListings({ status: 'analyzed', limit: 500 });
+        let costsMissing = 0;
+        for (const listing of analyzedListings) {
+          if (!listing.price) continue;
+          const existingCost = db.getCostBreakdown(listing.id);
+          if (!existingCost) {
+            costsMissing++;
+            const isDealer = listing.sellerType === 'dealer';
+            let pricingAnalysis = null;
+            if (listing.aiAnalysis) {
+              try {
+                pricingAnalysis = JSON.parse(listing.aiAnalysis)?.pricing || null;
+              } catch {}
+            }
+            const cost = calculateTotalCost(listing.price, pricingAnalysis, budget, isDealer);
+            db.saveCostBreakdown(listing.id, {
+              askingPrice: listing.price,
+              estimatedFinalPrice: listing.price,
+              fees: {
+                adminFee: isDealer ? 499 : 0,
+                omvicFee: cost.omvicFee,
+                tireStewardship: 20,
+                dealerFees: cost.estimatedDealerFees,
+                certification: cost.estimatedCertification,
+              },
+              taxRate: 0.13,
+              taxAmount: cost.hst,
+              registrationIncluded: true,
+              registrationCost: cost.licensing,
+              totalEstimatedCost: cost.totalCost,
+              budget,
+            });
+          }
+        }
+        if (costsMissing > 0) {
+          console.log(`  Calculated costs for ${costsMissing} analyzed listings`);
+        }
+      }
     } else {
       console.log('\n⏭️  PHASE 2: ANALYZE (skipped)\n');
     }
@@ -218,8 +286,6 @@ export const pipelineCommand = new Command('pipeline')
     if (!options.skipOutreach) {
       console.log('\n📧 PHASE 3: OUTREACH\n');
       console.log('-'.repeat(40));
-
-      const budget = config.search.priceMax || 18000;
 
       // Get all listings and rank them
       const listings = db.listListings({ limit: 1000 });
@@ -336,6 +402,43 @@ export const pipelineCommand = new Command('pipeline')
             if (matchedListing) {
               console.log(`    Matched to #${matchedListing.id}`);
 
+              // Process links in the email
+              if (!options.dryRun) {
+                const links = extractLinksFromEmail(email);
+                const relevantLinks = filterRelevantLinks(links);
+                if (relevantLinks.length > 0) {
+                  console.log(`    🔗 Found ${relevantLinks.length} links to process...`);
+                  try {
+                    const linkResults = await processEmailLinks(email, matchedListing);
+                    results.linksProcessed += linkResults.linksProcessed;
+
+                    // Update listing with any enriched data
+                    if (Object.keys(linkResults.enrichedData).length > 0) {
+                      db.updateListing(matchedListing.id, linkResults.enrichedData);
+                      console.log(`    ✅ Enriched listing with data from links`);
+                    }
+
+                    // If we found a CARFAX URL but don't have CARFAX yet, note it
+                    if (linkResults.carfaxUrl && !matchedListing.carfaxReceived) {
+                      console.log(`    📄 CARFAX link found: ${linkResults.carfaxUrl}`);
+                      // Could potentially fetch CARFAX from URL here in future
+                    }
+
+                    // Store additional photo URLs
+                    if (linkResults.additionalPhotos.length > 0) {
+                      const existingPhotos = matchedListing.photoUrls || [];
+                      const newPhotos = [...new Set([...existingPhotos, ...linkResults.additionalPhotos])];
+                      if (newPhotos.length > existingPhotos.length) {
+                        // Note: would need to update database schema to store these
+                        console.log(`    📷 Found ${linkResults.additionalPhotos.length} additional photos`);
+                      }
+                    }
+                  } catch (error) {
+                    console.log(`    ⚠️ Link processing error: ${error}`);
+                  }
+                }
+              }
+
               // Check for CARFAX
               const carfaxAttachment = email.attachments.find(
                 a => a.contentType === 'application/pdf' &&
@@ -415,6 +518,7 @@ export const pipelineCommand = new Command('pipeline')
     console.log(`  Listings analyzed:  ${results.analyzed}`);
     console.log(`  Sellers contacted:  ${results.contacted}`);
     console.log(`  Emails processed:   ${results.emailsProcessed}`);
+    console.log(`  Links processed:    ${results.linksProcessed}`);
     console.log(`  CARFAX received:    ${results.carfaxReceived}`);
 
     if (options.dryRun) {

@@ -1,10 +1,11 @@
 import { Command } from 'commander';
 import { getDatabase } from '../../database/index.js';
-import { EmailClient } from '../../email/client.js';
+import { EmailClient, saveEmailAttachments } from '../../email/client.js';
+import { extractLinksFromEmail, filterRelevantLinks, processEmailLinks } from '../../email/link-processor.js';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { Listing } from '../../database/client.js';
+import type { Listing, ConversationMessage } from '../../database/client.js';
 
 const WORKSPACE_DIR = 'workspace';
 const LISTINGS_DIR = path.join(WORKSPACE_DIR, 'listings');
@@ -594,6 +595,58 @@ export const smartRespondCommand = new Command('smart-respond')
           attachmentInfo += `\n**NOTE: Vehicle history report received and saved.**\n`;
         }
 
+        // Process links in email
+        const links = extractLinksFromEmail(email);
+        const relevantLinks = filterRelevantLinks(links);
+        let linkInfo = '';
+        if (relevantLinks.length > 0) {
+          console.log(`🔗 Found ${relevantLinks.length} links in email`);
+          linkInfo = '\n## Links in this email\n';
+          for (const link of relevantLinks) {
+            linkInfo += `- [${link.type}] ${link.url.slice(0, 60)}${link.url.length > 60 ? '...' : ''}\n`;
+          }
+
+          // Process links to extract additional info
+          try {
+            const linkResults = await processEmailLinks(email, matchedListing);
+            if (linkResults.linksProcessed > 0) {
+              console.log(`   Processed ${linkResults.linksProcessed} links`);
+
+              // Update listing with any enriched data (like VIN)
+              if (Object.keys(linkResults.enrichedData).length > 0) {
+                db.updateListing(matchedListing.id, linkResults.enrichedData);
+                linkInfo += '\n**Extracted from links:**\n';
+                for (const [key, value] of Object.entries(linkResults.enrichedData)) {
+                  linkInfo += `- ${key}: ${value}\n`;
+                }
+              }
+
+              // Note CARFAX URL if found
+              if (linkResults.carfaxUrl && !matchedListing.carfaxReceived) {
+                linkInfo += `\n**CARFAX link found:** ${linkResults.carfaxUrl}\n`;
+              }
+            }
+          } catch (linkError) {
+            console.log(`   ⚠️ Link processing error: ${linkError}`);
+          }
+        }
+        attachmentInfo += linkInfo;
+
+        // Save to conversation history in database
+        const newMessage: ConversationMessage = {
+          date: email.date?.toISOString() || new Date().toISOString(),
+          direction: 'inbound',
+          channel: 'email',
+          subject: email.subject,
+          body: email.text,
+          attachments: email.attachments.map(a => a.filename),
+        };
+        const existingConversation = matchedListing.sellerConversation || [];
+        db.updateListing(matchedListing.id, {
+          sellerConversation: [...existingConversation, newMessage],
+          lastSellerResponseAt: new Date().toISOString(),
+        });
+
         // Invoke Claude for analysis
         console.log('🧠 Analyzing with Claude...');
 
@@ -654,6 +707,29 @@ export const smartRespondCommand = new Command('smart-respond')
               subject: `Re: ${email.subject}`,
               text: analysis.response,
             }, 'outbound');
+
+            // Save to conversation history in database
+            const outboundMessage: ConversationMessage = {
+              date: new Date().toISOString(),
+              direction: 'outbound',
+              channel: 'email',
+              subject: `Re: ${email.subject}`,
+              body: analysis.response,
+            };
+            const currentConversation = db.getListing(matchedListing.id)?.sellerConversation || [];
+            db.updateListing(matchedListing.id, {
+              sellerConversation: [...currentConversation, outboundMessage],
+              lastOurResponseAt: new Date().toISOString(),
+            });
+
+            // Log audit entry
+            db.logAudit({
+              listingId: matchedListing.id,
+              action: 'email_sent',
+              description: `Auto-response sent: ${analysis.action}`,
+              reasoning: analysis.reasoning,
+              triggeredBy: 'claude',
+            });
 
             responded++;
           }

@@ -18,6 +18,13 @@ import { exportCommand } from './commands/export.js';
 import { pipelineCommand } from './commands/pipeline.js';
 import { syncWorkspaceCommand, addEmailCommand, askClaudeCommand, analyzeEmailCommand } from './commands/workspace.js';
 import { smartRespondCommand, recommendCommand } from './commands/smart-respond.js';
+import { auditCommand } from './commands/audit.js';
+import { approvalsListCommand, approveCommand, rejectCommand, approveInteractiveCommand, checkpointsConfigCommand } from './commands/approvals.js';
+import { dashboardCommand } from './commands/dashboard.js';
+import { costCommand, costAllCommand } from './commands/cost.js';
+import { processLinksCommand } from './commands/process-links.js';
+import { emailFollowupCommand } from './commands/email-followup.js';
+import { rankOffersCommand, aiRankCommand } from './commands/rank-offers.js';
 
 const program = new Command();
 
@@ -73,5 +80,32 @@ program.addCommand(analyzeEmailCommand);
 // Smart AI-powered commands
 program.addCommand(smartRespondCommand);
 program.addCommand(recommendCommand);
+
+// Audit and tracking commands
+program.addCommand(auditCommand);
+
+// Approval checkpoint commands
+program.addCommand(approvalsListCommand);
+program.addCommand(approveCommand);
+program.addCommand(rejectCommand);
+program.addCommand(approveInteractiveCommand);
+program.addCommand(checkpointsConfigCommand);
+
+// Portfolio management
+program.addCommand(dashboardCommand);
+
+// Cost calculation commands
+program.addCommand(costCommand);
+program.addCommand(costAllCommand);
+
+// Link processing commands
+program.addCommand(processLinksCommand);
+
+// Email follow-up flow
+program.addCommand(emailFollowupCommand);
+
+// Ranking commands
+program.addCommand(rankOffersCommand);
+program.addCommand(aiRankCommand);
 
 program.parse();

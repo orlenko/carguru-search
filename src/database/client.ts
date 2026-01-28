@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { SCHEMA, MIGRATIONS, type ListingStatus, type InfoStatus } from './schema.js';
+import { SCHEMA, MIGRATIONS, type ListingStatus, type InfoStatus, type ListingState, isValidTransition, getStateDescription } from './schema.js';
 import path from 'path';
 
 export interface ConversationMessage {
@@ -35,6 +35,22 @@ export interface NewEmailAttachment {
   sizeBytes?: number;
   attachmentType?: 'carfax' | 'photo' | 'document' | 'other';
   isRelevant?: boolean;
+}
+
+export interface VehicleSpecs {
+  bodyType?: string;
+  engine?: string;
+  cylinders?: number;
+  transmission?: string;
+  drivetrain?: string;
+  exteriorColor?: string;
+  interiorColor?: string;
+  doors?: number;
+  fuelType?: string;
+  passengers?: number;
+  fuelCityL100km?: number;
+  fuelHighwayL100km?: number;
+  fuelCombinedL100km?: number;
 }
 
 export interface Listing {
@@ -75,9 +91,25 @@ export interface Listing {
   carfaxSummary: string | null;
   lastContactedAt: string | null;
   contactAttempts: number;
+  // Timeline tracking
+  firstResponseAt: string | null;
+  lastSellerResponseAt: string | null;
+  lastOurResponseAt: string | null;
+  viewingScheduledFor: string | null;
+  followUpDueAt: string | null;
+  // Readiness tracking
+  readinessScore: number | null;
+  priceNegotiated: boolean;
+  negotiatedPrice: number | null;
+  // Notes
   notes: string | null;
   sellerConversation: ConversationMessage[] | null;
+  // Vehicle specifications
+  specs: VehicleSpecs | null;
+  // Timestamps
   discoveredAt: string;
+  analyzedAt: string | null;
+  contactedAt: string | null;
   updatedAt: string;
 }
 
@@ -104,6 +136,7 @@ export interface NewListing {
   description?: string;
   features?: string[];
   photoUrls?: string[];
+  specs?: VehicleSpecs;
 }
 
 export class DatabaseClient {
@@ -145,12 +178,12 @@ export class DatabaseClient {
         source, sourceId, sourceUrl, vin, year, make, model, trim,
         mileageKm, price, sellerType, sellerName, sellerPhone, sellerEmail,
         dealerRating, city, province, postalCode, distanceKm, description,
-        features, photoUrls
+        features, photoUrls, specs
       ) VALUES (
         @source, @sourceId, @sourceUrl, @vin, @year, @make, @model, @trim,
         @mileageKm, @price, @sellerType, @sellerName, @sellerPhone, @sellerEmail,
         @dealerRating, @city, @province, @postalCode, @distanceKm, @description,
-        @features, @photoUrls
+        @features, @photoUrls, @specs
       )
       ON CONFLICT(source, sourceId) DO UPDATE SET
         sourceUrl = excluded.sourceUrl,
@@ -160,9 +193,14 @@ export class DatabaseClient {
         sellerPhone = COALESCE(excluded.sellerPhone, sellerPhone),
         sellerEmail = COALESCE(excluded.sellerEmail, sellerEmail),
         dealerRating = COALESCE(excluded.dealerRating, dealerRating),
-        description = COALESCE(excluded.description, description),
+        description = CASE
+          WHEN excluded.description IS NOT NULL AND (description IS NULL OR length(excluded.description) > length(description))
+          THEN excluded.description
+          ELSE description
+        END,
         features = COALESCE(excluded.features, features),
         photoUrls = COALESCE(excluded.photoUrls, photoUrls),
+        specs = COALESCE(excluded.specs, specs),
         updatedAt = datetime('now')
       RETURNING id
     `);
@@ -185,6 +223,7 @@ export class DatabaseClient {
       description: listing.description || null,
       features: listing.features ? JSON.stringify(listing.features) : null,
       photoUrls: listing.photoUrls ? JSON.stringify(listing.photoUrls) : null,
+      specs: listing.specs ? JSON.stringify(listing.specs) : null,
     }) as { id: number };
 
     return result.id;
@@ -265,6 +304,13 @@ export class DatabaseClient {
       'serviceRecordCount', 'carfaxSummary', 'lastContactedAt', 'contactAttempts',
       'notes', 'sellerConversation', 'vin', 'price', 'mileageKm', 'sellerPhone',
       'sellerEmail',
+      // Timeline fields
+      'firstResponseAt', 'lastSellerResponseAt', 'lastOurResponseAt',
+      'viewingScheduledFor', 'followUpDueAt',
+      // Readiness fields
+      'readinessScore', 'priceNegotiated', 'negotiatedPrice',
+      // Additional timestamps
+      'analyzedAt', 'contactedAt',
     ];
 
     const fieldsToUpdate: string[] = [];
@@ -375,6 +421,7 @@ export class DatabaseClient {
       photoUrls: row.photoUrls ? JSON.parse(row.photoUrls as string) : null,
       redFlags: row.redFlags ? JSON.parse(row.redFlags as string) : null,
       sellerConversation: row.sellerConversation ? JSON.parse(row.sellerConversation as string) : null,
+      specs: row.specs ? JSON.parse(row.specs as string) : null,
       carfaxReceived: Boolean(row.carfaxReceived),
       infoStatus: (row.infoStatus as InfoStatus) || 'pending',
     } as Listing;
@@ -490,6 +537,488 @@ export class DatabaseClient {
       createdAt: string;
       sentAt: string | null;
     }>;
+  }
+
+  /**
+   * Transition a listing to a new state with validation and audit logging
+   */
+  transitionState(
+    listingId: number,
+    newState: ListingState,
+    options: {
+      triggeredBy?: 'system' | 'user' | 'claude';
+      reasoning?: string;
+      context?: Record<string, unknown>;
+    } = {}
+  ): { success: boolean; error?: string } {
+    const listing = this.getListing(listingId);
+    if (!listing) {
+      return { success: false, error: 'Listing not found' };
+    }
+
+    const currentState = listing.status as ListingState;
+
+    // Validate transition
+    if (!isValidTransition(currentState, newState)) {
+      return {
+        success: false,
+        error: `Invalid transition from '${currentState}' to '${newState}'. Allowed: ${getStateDescription(currentState)}`,
+      };
+    }
+
+    // Update the listing state
+    this.updateListing(listingId, { status: newState });
+
+    // Set timestamp based on state
+    if (newState === 'analyzed') {
+      this.updateListing(listingId, { analyzedAt: new Date().toISOString() });
+    } else if (newState === 'contacted') {
+      this.updateListing(listingId, { contactedAt: new Date().toISOString() });
+    }
+
+    // Log the transition
+    this.logAudit({
+      listingId,
+      action: 'state_change',
+      fromState: currentState,
+      toState: newState,
+      description: `State changed from '${currentState}' to '${newState}'`,
+      reasoning: options.reasoning,
+      context: options.context,
+      triggeredBy: options.triggeredBy || 'system',
+    });
+
+    return { success: true };
+  }
+
+  /**
+   * Log an audit entry
+   */
+  logAudit(entry: {
+    listingId?: number;
+    action: string;
+    fromState?: string;
+    toState?: string;
+    description?: string;
+    reasoning?: string;
+    context?: Record<string, unknown>;
+    triggeredBy?: string;
+    sessionId?: string;
+  }): number {
+    const result = this.db.prepare(`
+      INSERT INTO audit_log (
+        listingId, action, fromState, toState, description,
+        reasoning, context, triggeredBy, sessionId
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id
+    `).get(
+      entry.listingId || null,
+      entry.action,
+      entry.fromState || null,
+      entry.toState || null,
+      entry.description || null,
+      entry.reasoning || null,
+      entry.context ? JSON.stringify(entry.context) : null,
+      entry.triggeredBy || 'system',
+      entry.sessionId || null
+    ) as { id: number };
+    return result.id;
+  }
+
+  /**
+   * Get audit log for a listing
+   */
+  getAuditLog(listingId: number): Array<{
+    id: number;
+    action: string;
+    fromState: string | null;
+    toState: string | null;
+    description: string | null;
+    reasoning: string | null;
+    triggeredBy: string;
+    createdAt: string;
+  }> {
+    return this.db.prepare(`
+      SELECT id, action, fromState, toState, description, reasoning, triggeredBy, createdAt
+      FROM audit_log WHERE listingId = ? ORDER BY createdAt DESC
+    `).all(listingId) as Array<{
+      id: number;
+      action: string;
+      fromState: string | null;
+      toState: string | null;
+      description: string | null;
+      reasoning: string | null;
+      triggeredBy: string;
+      createdAt: string;
+    }>;
+  }
+
+  /**
+   * Save or update cost breakdown for a listing
+   */
+  saveCostBreakdown(listingId: number, cost: {
+    askingPrice?: number;
+    negotiatedPrice?: number;
+    estimatedFinalPrice?: number;
+    fees?: Record<string, number>;
+    taxRate?: number;
+    taxAmount?: number;
+    registrationIncluded?: boolean;
+    registrationCost?: number;
+    totalEstimatedCost?: number;
+    budget?: number;
+  }): void {
+    const remainingBudget = cost.budget && cost.totalEstimatedCost
+      ? cost.budget - cost.totalEstimatedCost
+      : null;
+    const withinBudget = remainingBudget !== null ? remainingBudget >= 0 : null;
+
+    this.db.prepare(`
+      INSERT INTO cost_breakdown (
+        listingId, askingPrice, negotiatedPrice, estimatedFinalPrice,
+        fees, taxRate, taxAmount, registrationIncluded, registrationCost,
+        totalEstimatedCost, budget, remainingBudget, withinBudget
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(listingId) DO UPDATE SET
+        askingPrice = excluded.askingPrice,
+        negotiatedPrice = excluded.negotiatedPrice,
+        estimatedFinalPrice = excluded.estimatedFinalPrice,
+        fees = excluded.fees,
+        taxRate = excluded.taxRate,
+        taxAmount = excluded.taxAmount,
+        registrationIncluded = excluded.registrationIncluded,
+        registrationCost = excluded.registrationCost,
+        totalEstimatedCost = excluded.totalEstimatedCost,
+        budget = excluded.budget,
+        remainingBudget = excluded.remainingBudget,
+        withinBudget = excluded.withinBudget,
+        updatedAt = datetime('now')
+    `).run(
+      listingId,
+      cost.askingPrice || null,
+      cost.negotiatedPrice || null,
+      cost.estimatedFinalPrice || null,
+      cost.fees ? JSON.stringify(cost.fees) : null,
+      cost.taxRate || null,
+      cost.taxAmount || null,
+      cost.registrationIncluded !== undefined ? (cost.registrationIncluded ? 1 : 0) : null,
+      cost.registrationCost || null,
+      cost.totalEstimatedCost || null,
+      cost.budget || null,
+      remainingBudget,
+      withinBudget !== null ? (withinBudget ? 1 : 0) : null
+    );
+  }
+
+  /**
+   * Get cost breakdown for a listing
+   */
+  getCostBreakdown(listingId: number): {
+    askingPrice: number | null;
+    negotiatedPrice: number | null;
+    estimatedFinalPrice: number | null;
+    fees: Record<string, number> | null;
+    taxRate: number | null;
+    taxAmount: number | null;
+    registrationIncluded: boolean | null;
+    registrationCost: number | null;
+    totalEstimatedCost: number | null;
+    budget: number | null;
+    remainingBudget: number | null;
+    withinBudget: boolean | null;
+  } | null {
+    const row = this.db.prepare(`
+      SELECT * FROM cost_breakdown WHERE listingId = ?
+    `).get(listingId) as Record<string, unknown> | undefined;
+
+    if (!row) return null;
+
+    return {
+      askingPrice: row.askingPrice as number | null,
+      negotiatedPrice: row.negotiatedPrice as number | null,
+      estimatedFinalPrice: row.estimatedFinalPrice as number | null,
+      fees: row.fees ? JSON.parse(row.fees as string) : null,
+      taxRate: row.taxRate as number | null,
+      taxAmount: row.taxAmount as number | null,
+      registrationIncluded: row.registrationIncluded !== null ? Boolean(row.registrationIncluded) : null,
+      registrationCost: row.registrationCost as number | null,
+      totalEstimatedCost: row.totalEstimatedCost as number | null,
+      budget: row.budget as number | null,
+      remainingBudget: row.remainingBudget as number | null,
+      withinBudget: row.withinBudget !== null ? Boolean(row.withinBudget) : null,
+    };
+  }
+
+  /**
+   * Calculate and update readiness score for a listing
+   */
+  calculateReadinessScore(listingId: number): number {
+    const listing = this.getListing(listingId);
+    if (!listing) return 0;
+
+    let score = 0;
+
+    // CARFAX received: +20
+    if (listing.carfaxReceived) score += 20;
+
+    // CARFAX clean (no accidents): +15
+    if (listing.carfaxReceived && (listing.accidentCount === 0 || listing.accidentCount === null)) {
+      score += 15;
+    }
+
+    // Price negotiated: +15
+    if (listing.priceNegotiated) score += 15;
+
+    // Within budget: +20 (check cost breakdown)
+    const cost = this.getCostBreakdown(listingId);
+    if (cost?.withinBudget) score += 20;
+
+    // Seller responsive (has replied): +10
+    if (listing.firstResponseAt) score += 10;
+
+    // No red flags: +20
+    if (!listing.redFlags || listing.redFlags.length === 0) score += 20;
+
+    // Update the listing
+    this.updateListing(listingId, { readinessScore: score });
+
+    return score;
+  }
+
+  /**
+   * Get listings needing follow-up (no response after X days)
+   */
+  getListingsNeedingFollowUp(daysSinceContact: number = 2): Listing[] {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - daysSinceContact);
+
+    const rows = this.db.prepare(`
+      SELECT * FROM listings
+      WHERE status IN ('contacted', 'awaiting_response')
+      AND lastContactedAt IS NOT NULL
+      AND lastContactedAt < ?
+      AND (lastSellerResponseAt IS NULL OR lastSellerResponseAt < lastContactedAt)
+      ORDER BY lastContactedAt ASC
+    `).all(cutoffDate.toISOString()) as Record<string, unknown>[];
+
+    return rows.map(row => this.rowToListing(row));
+  }
+
+  // =========================================================================
+  // Approval Queue Methods
+  // =========================================================================
+
+  /**
+   * Queue an action for human approval
+   */
+  queueForApproval(entry: {
+    listingId?: number;
+    actionType: string;
+    description: string;
+    reasoning?: string;
+    payload: Record<string, unknown>;
+    checkpointType?: string;
+    thresholdValue?: string;
+    expiresAt?: string;
+  }): number {
+    const result = this.db.prepare(`
+      INSERT INTO approval_queue (
+        listingId, actionType, description, reasoning, payload,
+        checkpointType, thresholdValue, expiresAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id
+    `).get(
+      entry.listingId || null,
+      entry.actionType,
+      entry.description,
+      entry.reasoning || null,
+      JSON.stringify(entry.payload),
+      entry.checkpointType || null,
+      entry.thresholdValue || null,
+      entry.expiresAt || null
+    ) as { id: number };
+
+    // Log to audit trail
+    this.logAudit({
+      listingId: entry.listingId,
+      action: 'approval_queued',
+      description: `Action '${entry.actionType}' queued for approval: ${entry.description}`,
+      reasoning: entry.reasoning,
+      context: { checkpointType: entry.checkpointType, thresholdValue: entry.thresholdValue },
+      triggeredBy: 'system',
+    });
+
+    return result.id;
+  }
+
+  /**
+   * Get pending approvals
+   */
+  getPendingApprovals(options: {
+    listingId?: number;
+    actionType?: string;
+    limit?: number;
+  } = {}): Array<{
+    id: number;
+    listingId: number | null;
+    actionType: string;
+    description: string;
+    reasoning: string | null;
+    payload: Record<string, unknown>;
+    checkpointType: string | null;
+    thresholdValue: string | null;
+    createdAt: string;
+    expiresAt: string | null;
+  }> {
+    let sql = `SELECT * FROM approval_queue WHERE status = 'pending'`;
+    const params: unknown[] = [];
+
+    if (options.listingId) {
+      sql += ` AND listingId = ?`;
+      params.push(options.listingId);
+    }
+
+    if (options.actionType) {
+      sql += ` AND actionType = ?`;
+      params.push(options.actionType);
+    }
+
+    // Exclude expired entries
+    sql += ` AND (expiresAt IS NULL OR expiresAt > datetime('now'))`;
+
+    sql += ` ORDER BY createdAt ASC`;
+
+    if (options.limit) {
+      sql += ` LIMIT ?`;
+      params.push(options.limit);
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+
+    return rows.map(row => ({
+      id: row.id as number,
+      listingId: row.listingId as number | null,
+      actionType: row.actionType as string,
+      description: row.description as string,
+      reasoning: row.reasoning as string | null,
+      payload: JSON.parse(row.payload as string),
+      checkpointType: row.checkpointType as string | null,
+      thresholdValue: row.thresholdValue as string | null,
+      createdAt: row.createdAt as string,
+      expiresAt: row.expiresAt as string | null,
+    }));
+  }
+
+  /**
+   * Approve a queued action
+   */
+  approveAction(approvalId: number, notes?: string): {
+    success: boolean;
+    payload?: Record<string, unknown>;
+    error?: string;
+  } {
+    const row = this.db.prepare(`
+      SELECT * FROM approval_queue WHERE id = ?
+    `).get(approvalId) as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return { success: false, error: 'Approval not found' };
+    }
+
+    if (row.status !== 'pending') {
+      return { success: false, error: `Approval already ${row.status}` };
+    }
+
+    // Check if expired
+    if (row.expiresAt && new Date(row.expiresAt as string) < new Date()) {
+      this.db.prepare(`
+        UPDATE approval_queue SET status = 'expired', resolvedAt = datetime('now')
+        WHERE id = ?
+      `).run(approvalId);
+      return { success: false, error: 'Approval has expired' };
+    }
+
+    // Approve it
+    this.db.prepare(`
+      UPDATE approval_queue
+      SET status = 'approved', resolvedBy = 'user', resolvedAt = datetime('now'), resolutionNotes = ?
+      WHERE id = ?
+    `).run(notes || null, approvalId);
+
+    // Log to audit trail
+    this.logAudit({
+      listingId: row.listingId as number | undefined,
+      action: 'approval_approved',
+      description: `Action '${row.actionType}' approved: ${row.description}`,
+      reasoning: notes,
+      triggeredBy: 'user',
+    });
+
+    return {
+      success: true,
+      payload: JSON.parse(row.payload as string),
+    };
+  }
+
+  /**
+   * Reject a queued action
+   */
+  rejectAction(approvalId: number, notes?: string): { success: boolean; error?: string } {
+    const row = this.db.prepare(`
+      SELECT * FROM approval_queue WHERE id = ?
+    `).get(approvalId) as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return { success: false, error: 'Approval not found' };
+    }
+
+    if (row.status !== 'pending') {
+      return { success: false, error: `Approval already ${row.status}` };
+    }
+
+    // Reject it
+    this.db.prepare(`
+      UPDATE approval_queue
+      SET status = 'rejected', resolvedBy = 'user', resolvedAt = datetime('now'), resolutionNotes = ?
+      WHERE id = ?
+    `).run(notes || null, approvalId);
+
+    // Log to audit trail
+    this.logAudit({
+      listingId: row.listingId as number | undefined,
+      action: 'approval_rejected',
+      description: `Action '${row.actionType}' rejected: ${row.description}`,
+      reasoning: notes,
+      triggeredBy: 'user',
+    });
+
+    return { success: true };
+  }
+
+  /**
+   * Get approval queue stats
+   */
+  getApprovalStats(): {
+    pending: number;
+    approved: number;
+    rejected: number;
+    expired: number;
+  } {
+    const row = this.db.prepare(`
+      SELECT
+        SUM(CASE WHEN status = 'pending' AND (expiresAt IS NULL OR expiresAt > datetime('now')) THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
+        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
+        SUM(CASE WHEN status = 'expired' OR (status = 'pending' AND expiresAt <= datetime('now')) THEN 1 ELSE 0 END) as expired
+      FROM approval_queue
+    `).get() as Record<string, number>;
+
+    return {
+      pending: row.pending || 0,
+      approved: row.approved || 0,
+      rejected: row.rejected || 0,
+      expired: row.expired || 0,
+    };
   }
 
   close(): void {

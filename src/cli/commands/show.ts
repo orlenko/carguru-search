@@ -199,6 +199,27 @@ export const showCommand = new Command('show')
         console.log(`  ${listing.description.slice(0, 500)}${listing.description.length > 500 ? '...' : ''}`);
       }
 
+      if (listing.specs) {
+        console.log('\n🔧 Vehicle Specifications:');
+        const s = listing.specs;
+        if (s.bodyType) console.log(`  Body Type:    ${s.bodyType}`);
+        if (s.engine) console.log(`  Engine:       ${s.engine}`);
+        if (s.cylinders) console.log(`  Cylinders:    ${s.cylinders}`);
+        if (s.transmission) console.log(`  Transmission: ${s.transmission}`);
+        if (s.drivetrain) console.log(`  Drivetrain:   ${s.drivetrain}`);
+        if (s.fuelType) console.log(`  Fuel Type:    ${s.fuelType}`);
+        if (s.exteriorColor) console.log(`  Exterior:     ${s.exteriorColor}`);
+        if (s.interiorColor) console.log(`  Interior:     ${s.interiorColor}`);
+        if (s.doors) console.log(`  Doors:        ${s.doors}`);
+        if (s.passengers) console.log(`  Passengers:   ${s.passengers}`);
+        if (s.fuelCityL100km || s.fuelHighwayL100km) {
+          const city = s.fuelCityL100km ? `${s.fuelCityL100km} L/100km city` : '';
+          const hwy = s.fuelHighwayL100km ? `${s.fuelHighwayL100km} L/100km hwy` : '';
+          const combined = s.fuelCombinedL100km ? `${s.fuelCombinedL100km} L/100km combined` : '';
+          console.log(`  Fuel Economy: ${[city, hwy, combined].filter(Boolean).join(' / ')}`);
+        }
+      }
+
       if (listing.notes) {
         console.log('\n📌 Notes:');
         console.log(`  ${listing.notes}`);

@@ -1,6 +1,6 @@
 import { chromium, type Browser, type Page, type BrowserContext } from 'playwright';
 import type { Scraper, ScraperResult } from './base.js';
-import type { NewListing } from '../database/client.js';
+import type { NewListing, VehicleSpecs } from '../database/client.js';
 import type { SearchConfig } from '../config.js';
 
 const AUTOTRADER_BASE_URL = 'https://www.autotrader.ca';
@@ -227,11 +227,13 @@ export class AutoTraderScraper implements Scraper {
       return listings;
     }
 
+    // First pass: extract basic info from all cards
+    const basicListings: NewListing[] = [];
     for (const card of cards) {
       try {
         const listing = await this.parseListingCard(card, config);
         if (listing) {
-          listings.push(listing);
+          basicListings.push(listing);
         }
       } catch (error) {
         // Log but continue with other cards
@@ -240,7 +242,146 @@ export class AutoTraderScraper implements Scraper {
       }
     }
 
+    // Second pass: fetch full details for each listing
+    for (const listing of basicListings) {
+      try {
+        console.log(`  Fetching details for ${listing.year} ${listing.make} ${listing.model}...`);
+        const enrichedListing = await this.fetchListingDetails(page, listing);
+        listings.push(enrichedListing);
+        await randomDelay(1500, 2500); // Polite delay between detail fetches
+      } catch (error) {
+        console.error(`  Error fetching details for ${listing.sourceId}:`, error);
+        listings.push(listing); // Keep the basic listing if detail fetch fails
+      }
+    }
+
     return listings;
+  }
+
+  private async fetchListingDetails(page: Page, listing: NewListing): Promise<NewListing> {
+    // Open the listing detail page
+    const detailPage = await page.context().newPage();
+
+    try {
+      await detailPage.goto(listing.sourceUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await randomDelay(2000, 3000); // Wait for page to fully render
+
+      // Extract full description from #descriptionWidget
+      const descWidget = await detailPage.$('#descriptionWidget');
+      if (descWidget) {
+        // Click "Read More" button to expand full text
+        const readMoreBtn = await descWidget.$('button, a, [role="button"]');
+        if (readMoreBtn) {
+          const btnText = await readMoreBtn.textContent();
+          if (btnText?.toLowerCase().includes('read') || btnText?.toLowerCase().includes('more')) {
+            try {
+              await readMoreBtn.click();
+              await randomDelay(300, 500);
+            } catch {
+              // Button may not be clickable, continue
+            }
+          }
+        }
+
+        const descText = await descWidget.textContent();
+        if (descText) {
+          // Clean up the description - remove "Description" prefix and extra whitespace
+          let cleanDesc = descText.trim();
+          if (cleanDesc.startsWith('Description')) {
+            cleanDesc = cleanDesc.substring('Description'.length).trim();
+          }
+          // Remove "Read More" / "Read Less" button text if present
+          cleanDesc = cleanDesc.replace(/Read\s*(More|Less)/gi, '').trim();
+          if (cleanDesc.length > 0) {
+            listing.description = cleanDesc;
+          }
+        }
+      }
+
+      // Extract VIN from CARFAX purchase URL (sometimes VIN is exposed there even when masked elsewhere)
+      const carfaxLinks = await detailPage.$$('a[href*="carfax.ca"]');
+      for (const link of carfaxLinks) {
+        const href = await link.getAttribute('href');
+        if (href) {
+          // Look for VIN parameter in URL: ?vin=2C4RDGBG5HR701066
+          const vinMatch = href.match(/[?&]vin=([A-HJ-NPR-Z0-9]{17})/i);
+          if (vinMatch && !vinMatch[1].includes('X')) {
+            // Found a real VIN (not masked with X's)
+            listing.vin = vinMatch[1].toUpperCase();
+            break;
+          }
+        }
+      }
+
+      // Extract seller contact info if available
+      const phoneSelectors = [
+        'a[href^="tel:"]',
+        '.dealer-phone a',
+        '[data-testid="seller-phone"]',
+      ];
+
+      for (const selector of phoneSelectors) {
+        const phoneElement = await detailPage.$(selector);
+        if (phoneElement) {
+          const phoneHref = await phoneElement.getAttribute('href');
+          if (phoneHref?.startsWith('tel:')) {
+            listing.sellerPhone = phoneHref.replace('tel:', '').trim();
+            break;
+          }
+          const phoneText = await phoneElement.textContent();
+          if (phoneText) {
+            listing.sellerPhone = phoneText.trim();
+            break;
+          }
+        }
+      }
+
+      // Extract features list from #featuresWidget
+      const featuresWidget = await detailPage.$('#featuresWidget, .features-list, .vehicle-features');
+      if (featuresWidget) {
+        const featureItems = await featuresWidget.$$('li, .feature-item, span');
+        const features: string[] = [];
+        for (const item of featureItems) {
+          const featureText = await item.textContent();
+          if (featureText?.trim() && featureText.trim().length > 2 && featureText.trim().length < 100) {
+            features.push(featureText.trim());
+          }
+        }
+        if (features.length > 0) {
+          listing.features = features;
+        }
+      }
+
+      // Extract more photos from gallery
+      const photoElements = await detailPage.$$('img[src*="autotrader"], img[data-src*="autotrader"]');
+      if (photoElements.length > 0) {
+        const photoUrls: string[] = [];
+        for (const img of photoElements.slice(0, 10)) { // Limit to 10 photos
+          const src = await img.getAttribute('src') || await img.getAttribute('data-src');
+          if (src && src.startsWith('http') && !src.includes('placeholder') && !src.includes('base64') && !src.includes('logo')) {
+            // Get higher resolution version if possible
+            const highResSrc = src.replace(/\/\d+x\d+\//, '/800x600/');
+            if (!photoUrls.includes(highResSrc)) {
+              photoUrls.push(highResSrc);
+            }
+          }
+        }
+        if (photoUrls.length > 0) {
+          listing.photoUrls = photoUrls;
+        }
+      }
+
+      // Extract vehicle specifications from embedded JSON
+      const specs = await this.extractSpecs(detailPage);
+      if (Object.keys(specs).length > 0) {
+        listing.specs = specs;
+      }
+
+    } finally {
+      await detailPage.close();
+    }
+
+    return listing;
   }
 
   private async parseListingCard(card: any, config: SearchConfig): Promise<NewListing | null> {
@@ -420,5 +561,85 @@ export class AutoTraderScraper implements Scraper {
       Object.defineProperty(navigator, 'languages', { get: () => ['en-CA', 'en-US', 'en'] });
       window.chrome = { runtime: {} };
     `);
+  }
+
+  private async extractSpecs(page: Page): Promise<VehicleSpecs> {
+    const specs: VehicleSpecs = {};
+    const pageContent = await page.content();
+
+    // Method 1: Extract from embedded JSON (most reliable)
+    // Look for the specs array in Angular's data
+    const specsArrayMatch = pageContent.match(/"specs"\s*:\s*\[([\s\S]*?)\]/);
+    if (specsArrayMatch) {
+      try {
+        const specsJson = '[' + specsArrayMatch[1] + ']';
+        const specsArray = JSON.parse(specsJson) as Array<{ key: string; value: string }>;
+
+        for (const spec of specsArray) {
+          const key = spec.key?.toLowerCase().replace(/\s+/g, '');
+          const value = spec.value;
+
+          switch (key) {
+            case 'bodytype':
+              specs.bodyType = value;
+              break;
+            case 'engine':
+              specs.engine = value;
+              break;
+            case 'cylinder':
+              specs.cylinders = parseInt(value, 10) || undefined;
+              break;
+            case 'transmission':
+              specs.transmission = value;
+              break;
+            case 'drivetrain':
+              specs.drivetrain = value;
+              break;
+            case 'exteriorcolour':
+            case 'exteriorcolor':
+              specs.exteriorColor = value;
+              break;
+            case 'interiorcolour':
+            case 'interiorcolor':
+              specs.interiorColor = value;
+              break;
+            case 'doors':
+              specs.doors = parseInt(value, 10) || undefined;
+              break;
+            case 'fueltype':
+              specs.fuelType = value;
+              break;
+            case 'passengers':
+            case 'seating':
+              specs.passengers = parseInt(value, 10) || undefined;
+              break;
+          }
+        }
+      } catch {
+        // JSON parsing failed, continue to fallback
+      }
+    }
+
+    // Method 2: Extract fuel economy from separate JSON block
+    const fuelMatch = pageContent.match(/"fuelEconomy"\s*:\s*\{([^}]+)\}/);
+    if (fuelMatch) {
+      try {
+        const fuelStr = '{' + fuelMatch[1] + '}';
+        const fuelData = JSON.parse(fuelStr);
+        if (fuelData.fuelCity) {
+          specs.fuelCityL100km = parseFloat(fuelData.fuelCity);
+        }
+        if (fuelData.fuelHighway) {
+          specs.fuelHighwayL100km = parseFloat(fuelData.fuelHighway);
+        }
+        if (fuelData.fuelCombined) {
+          specs.fuelCombinedL100km = parseFloat(fuelData.fuelCombined);
+        }
+      } catch {
+        // JSON parsing failed
+      }
+    }
+
+    return specs;
   }
 }
