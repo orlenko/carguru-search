@@ -12,54 +12,13 @@ import { WebFormContact, generateContactMessage } from '../../contact/web-form.j
 import { EmailClient } from '../../email/client.js';
 import { generateEmail } from '../../email/templates.js';
 import { processEmailLinks, extractLinksFromEmail, filterRelevantLinks } from '../../email/link-processor.js';
+import { shouldSkipEmail } from '../../email/filters.js';
 import { analyzeCarfaxBuffer } from '../../analyzers/carfax-analyzer.js';
 import { analyzeListingWithClaude } from '../../analyzers/listing-analyzer.js';
 import { AutoTraderScraper } from '../../scrapers/autotrader.js';
 import type { ListingAnalysis } from '../../analyzers/listing-analyzer.js';
 import * as fs from 'fs';
 import * as path from 'path';
-
-/**
- * Check if an email should be skipped (automated, noreply, marketing, etc.)
- */
-function shouldSkipEmail(email: { from: string; subject: string; text: string }): { skip: boolean; reason: string } {
-  const fromLower = email.from.toLowerCase();
-  const subjectLower = email.subject.toLowerCase();
-
-  // Skip noreply addresses
-  if (fromLower.includes('noreply') || fromLower.includes('no-reply') || fromLower.includes('donotreply')) {
-    return { skip: true, reason: 'noreply address' };
-  }
-
-  // Skip automated/system addresses
-  const automatedPatterns = [
-    'mailer-daemon', 'postmaster', 'autoresponder', 'auto-reply', 'automated',
-    'notification@', 'notifications@', 'alert@', 'alerts@', 'system@',
-  ];
-  for (const pattern of automatedPatterns) {
-    if (fromLower.includes(pattern)) {
-      return { skip: true, reason: `automated address` };
-    }
-  }
-
-  // Skip marketing/newsletter subjects
-  const marketingSubjects = [
-    'subscription confirmed', 'you\'re subscribed', 'welcome to', 'thank you for signing up',
-    'price alert', 'price drop', 'similar vehicles', 'new listings', 'unsubscribe',
-    'weekly digest', 'daily digest', 'newsletter',
-  ];
-  for (const pattern of marketingSubjects) {
-    if (subjectLower.includes(pattern)) {
-      return { skip: true, reason: `marketing email` };
-    }
-  }
-
-  if (subjectLower.includes('confirmation') && !subjectLower.includes('viewing')) {
-    return { skip: true, reason: 'confirmation email' };
-  }
-
-  return { skip: false, reason: '' };
-}
 
 interface PipelineOptions {
   dryRun: boolean;
@@ -376,7 +335,9 @@ export const pipelineCommand = new Command('pipeline')
         console.log(`Found ${emails.length} new email(s)\n`);
 
         if (emails.length > 0) {
-          const contactedListings = db.listListings({ status: 'contacted', limit: 100 });
+          // Get all active listings for matching (not just 'contacted')
+          const activeStatuses = ['contacted', 'awaiting_response', 'negotiating', 'viewing_scheduled', 'inspected'] as const;
+          const contactedListings = db.listListings({ status: activeStatuses as any, limit: 200 });
 
           for (const email of emails) {
             console.log(`  From: ${email.from.slice(0, 50)}...`);

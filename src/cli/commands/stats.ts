@@ -14,7 +14,7 @@ export const statsCommand = new Command('stats')
 
       if (Object.keys(stats.byStatus).length > 0) {
         console.log('\nBy Status:');
-        const statusOrder = ['new', 'contacted', 'carfax_requested', 'carfax_received', 'analyzed', 'shortlisted', 'rejected'];
+        const statusOrder = ['discovered', 'analyzed', 'contacted', 'awaiting_response', 'negotiating', 'viewing_scheduled', 'inspected', 'offer_made', 'purchased', 'rejected', 'withdrawn'];
         for (const status of statusOrder) {
           if (stats.byStatus[status]) {
             console.log(`  ${status.padEnd(20)} ${stats.byStatus[status]}`);

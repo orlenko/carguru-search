@@ -6,7 +6,7 @@ export const analyzeCommand = new Command('analyze')
   .description('Analyze listings using AI to detect red flags and assess quality')
   .argument('[id]', 'Specific listing ID to analyze (or "all" for unanalyzed listings)')
   .option('-f, --force', 'Re-analyze even if already analyzed')
-  .option('--status <status>', 'Only analyze listings with this status', 'new')
+  .option('--status <status>', 'Only analyze listings with this status', 'discovered')
   .option('-n, --limit <number>', 'Limit number of listings to analyze', '10')
   .action(async (id, options) => {
     try {

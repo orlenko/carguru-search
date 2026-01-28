@@ -277,6 +277,21 @@ CREATE TABLE IF NOT EXISTS approval_queue (
 
 CREATE INDEX IF NOT EXISTS idx_approval_queue_status ON approval_queue(status);
 CREATE INDEX IF NOT EXISTS idx_approval_queue_listing ON approval_queue(listingId);
+
+-- Processed emails tracking (for deduplication)
+CREATE TABLE IF NOT EXISTS processed_emails (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  messageId TEXT NOT NULL UNIQUE,     -- RFC Message-ID header
+  listingId INTEGER,                   -- Matched listing (if any)
+  fromAddress TEXT,                    -- Sender
+  subject TEXT,                        -- Subject line
+  processedAt TEXT DEFAULT (datetime('now')),
+  action TEXT,                         -- What action was taken (responded, skipped, etc.)
+
+  FOREIGN KEY (listingId) REFERENCES listings(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_emails_messageId ON processed_emails(messageId);
 `;
 
 /**

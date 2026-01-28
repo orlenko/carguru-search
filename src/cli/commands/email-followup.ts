@@ -7,6 +7,7 @@ import { Command } from 'commander';
 import { getDatabase } from '../../database/index.js';
 import { EmailClient, saveEmailAttachments } from '../../email/client.js';
 import { extractLinksFromEmail, filterRelevantLinks, processEmailLinks } from '../../email/link-processor.js';
+import { shouldSkipEmail } from '../../email/filters.js';
 import { analyzeCarfaxBuffer } from '../../analyzers/carfax-analyzer.js';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
@@ -185,28 +186,6 @@ ${msg.body}
   return listingDir;
 }
 
-/**
- * Check if an email should be skipped
- */
-function shouldSkipEmail(email: { from: string; subject: string; text: string }): boolean {
-  const fromLower = email.from.toLowerCase();
-  const subjectLower = email.subject.toLowerCase();
-
-  const skipPatterns = [
-    'noreply', 'no-reply', 'donotreply', 'mailer-daemon', 'postmaster',
-    'autoresponder', 'notification@', 'newsletter', 'unsubscribe',
-    'price alert', 'similar vehicles', 'subscription',
-  ];
-
-  for (const pattern of skipPatterns) {
-    if (fromLower.includes(pattern) || subjectLower.includes(pattern)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 export const emailFollowupCommand = new Command('email-followup')
   .description('Flow 2: Check emails and follow up with Claude-powered responses')
   .option('--listing <id>', 'Process emails for specific listing only')
@@ -300,7 +279,7 @@ export const emailFollowupCommand = new Command('email-followup')
       let responded = 0;
 
       for (const email of emails) {
-        if (shouldSkipEmail(email)) {
+        if (shouldSkipEmail(email).skip) {
           continue;
         }
 

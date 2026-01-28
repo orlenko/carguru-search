@@ -51,6 +51,23 @@ const EmailConfigSchema = z.object({
   }),
 }).optional();
 
+const CheckpointsConfigSchema = z.object({
+  // Require approval before sending offers above this amount
+  offerApprovalThreshold: z.number().default(10000),
+  // Require approval before scheduling any viewing
+  viewingRequiresApproval: z.boolean().default(true),
+  // Alert when total potential spend across all deals exceeds budget
+  portfolioExposureAlert: z.number().optional(),
+  // Alert when negotiation stalls for this many days
+  staleNegotiationDays: z.number().default(3),
+  // Auto-send follow-up after this many days without response
+  autoFollowupDays: z.number().default(2),
+  // Max automated follow-ups before requiring human decision
+  maxAutoFollowups: z.number().default(2),
+  // Enable/disable checkpoints globally
+  enabled: z.boolean().default(true),
+}).default({});
+
 const ConfigSchema = z.object({
   search: SearchConfigSchema,
   scoring: ScoringConfigSchema.default({
@@ -66,12 +83,14 @@ const ConfigSchema = z.object({
     preferences: {},
   }),
   email: EmailConfigSchema,
+  checkpoints: CheckpointsConfigSchema,
   privateNotes: z.string().optional(),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
 export type SearchConfig = z.infer<typeof SearchConfigSchema>;
 export type ScoringConfig = z.infer<typeof ScoringConfigSchema>;
+export type CheckpointsConfig = z.infer<typeof CheckpointsConfigSchema>;
 
 let cachedConfig: Config | null = null;
 
@@ -111,4 +130,9 @@ export function getEmailCredentials(): { user: string; password: string } {
     user: getEnv('EMAIL_USER'),
     password: getEnv('EMAIL_PASSWORD'),
   };
+}
+
+export function getCheckpointsConfig(): CheckpointsConfig {
+  const config = loadConfig();
+  return config.checkpoints;
 }

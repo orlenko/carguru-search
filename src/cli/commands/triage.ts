@@ -143,7 +143,7 @@ async function promptUser(rl: readline.Interface, prompt: string): Promise<strin
 export const triageCommand = new Command('triage')
   .description('Interactively triage new listings')
   .option('-l, --limit <number>', 'Maximum listings to show', '20')
-  .option('-s, --status <status>', 'Filter by status (default: new)', 'new')
+  .option('-s, --status <status>', 'Filter by status (default: discovered)', 'discovered')
   .option('--min-score <number>', 'Only show listings with score >= value')
   .action(async (options) => {
     const db = getDatabase();
@@ -190,8 +190,8 @@ export const triageCommand = new Command('triage')
         switch (answer) {
           case 'i':
           case 'interesting':
-            db.updateListing(listing.id, { status: 'interesting' });
-            console.log(`  -> Marked as INTERESTING`);
+            db.updateListing(listing.id, { status: 'analyzed' });
+            console.log(`  -> Marked as ANALYZED (ready to contact)`);
             triaged++;
             interesting++;
             decided = true;
@@ -250,7 +250,7 @@ export const triageCommand = new Command('triage')
     console.log(`  Skipped: ${skipped}`);
     console.log('='.repeat(40));
     console.log('\nNext steps:');
-    console.log('  - Run `carsearch list --status interesting` to see interesting listings');
+    console.log('  - Run `carsearch list --status analyzed` to see triaged/interesting listings');
     console.log('  - Run `carsearch export` to export interesting listings for analysis\n');
 
     rl.close();

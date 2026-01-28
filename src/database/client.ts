@@ -1021,6 +1021,55 @@ export class DatabaseClient {
     };
   }
 
+  // =====================================================
+  // PROCESSED EMAIL TRACKING (Deduplication)
+  // =====================================================
+
+  /**
+   * Check if an email has already been processed
+   */
+  isEmailProcessed(messageId: string): boolean {
+    if (!messageId) return false;
+    const row = this.db.prepare(
+      'SELECT id FROM processed_emails WHERE messageId = ?'
+    ).get(messageId);
+    return !!row;
+  }
+
+  /**
+   * Mark an email as processed
+   */
+  markEmailProcessed(data: {
+    messageId: string;
+    listingId?: number | null;
+    fromAddress?: string;
+    subject?: string;
+    action: string;
+  }): void {
+    if (!data.messageId) return;
+
+    this.db.prepare(`
+      INSERT OR IGNORE INTO processed_emails (messageId, listingId, fromAddress, subject, action)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      data.messageId,
+      data.listingId || null,
+      data.fromAddress || null,
+      data.subject || null,
+      data.action
+    );
+  }
+
+  /**
+   * Get all processed email IDs (for bulk checking)
+   */
+  getProcessedEmailIds(): Set<string> {
+    const rows = this.db.prepare(
+      'SELECT messageId FROM processed_emails'
+    ).all() as { messageId: string }[];
+    return new Set(rows.map(r => r.messageId));
+  }
+
   close(): void {
     this.db.close();
   }

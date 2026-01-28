@@ -60,6 +60,28 @@ email:
     port: 587
     secure: false
 
+checkpoints:
+  # Enable/disable human approval checkpoints globally
+  enabled: true
+
+  # Require approval before sending offers above this amount (CAD)
+  offerApprovalThreshold: 10000
+
+  # Require approval before scheduling any viewing
+  viewingRequiresApproval: true
+
+  # Alert when total potential spend across all active deals exceeds this
+  # portfolioExposureAlert: 20000
+
+  # Alert when a negotiation stalls for this many days
+  staleNegotiationDays: 3
+
+  # Auto-send follow-up after this many days without response
+  autoFollowupDays: 2
+
+  # Max automated follow-ups before requiring human decision
+  maxAutoFollowups: 2
+
 # Personal notes (completely private, never shared with dealers)
 privateNotes: |
   Add any personal notes about your specific needs here.

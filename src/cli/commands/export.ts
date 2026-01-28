@@ -27,7 +27,7 @@ function calculateInfoReadiness(listing: Listing): number {
   // Has seller response - check conversation or contact attempts > 0 and status indicates response
   if (listing.sellerConversation && listing.sellerConversation.some(m => m.direction === 'inbound')) {
     score += 30;
-  } else if (listing.status === 'carfax_received' || listing.status === 'analyzed') {
+  } else if (listing.status === 'analyzed' || listing.status === 'contacted') {
     score += 15; // Partial credit for progress
   }
 
@@ -393,7 +393,7 @@ function archiveCurrentBatch(): void {
 
 export const exportCommand = new Command('export')
   .description('Export interesting listings to disk for Claude analysis')
-  .option('-s, --status <status>', 'Filter by status (comma-separated)', 'interesting')
+  .option('-s, --status <status>', 'Filter by status (comma-separated)', 'analyzed')
   .option('--min-info <percent>', 'Minimum info readiness percentage', '0')
   .option('--force <ids>', 'Force re-export specific IDs (comma-separated)')
   .option('--new-batch', 'Archive current batch and start fresh')

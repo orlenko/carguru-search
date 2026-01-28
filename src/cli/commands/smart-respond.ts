@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { getDatabase } from '../../database/index.js';
 import { EmailClient, saveEmailAttachments } from '../../email/client.js';
 import { extractLinksFromEmail, filterRelevantLinks, processEmailLinks } from '../../email/link-processor.js';
+import { shouldSkipEmail } from '../../email/filters.js';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -9,46 +10,6 @@ import type { Listing, ConversationMessage } from '../../database/client.js';
 
 const WORKSPACE_DIR = 'workspace';
 const LISTINGS_DIR = path.join(WORKSPACE_DIR, 'listings');
-
-/**
- * Check if an email should be skipped (automated, noreply, marketing, etc.)
- */
-function shouldSkipEmail(email: { from: string; subject: string; text: string }): { skip: boolean; reason: string } {
-  const fromLower = email.from.toLowerCase();
-  const subjectLower = email.subject.toLowerCase();
-
-  // Skip noreply addresses
-  if (fromLower.includes('noreply') || fromLower.includes('no-reply') || fromLower.includes('donotreply')) {
-    return { skip: true, reason: 'noreply address' };
-  }
-
-  // Skip automated/system addresses
-  const automatedPatterns = [
-    'mailer-daemon', 'postmaster', 'autoresponder', 'auto-reply',
-    'automated', 'notification@', 'notifications@', 'alert@',
-    'alerts@', 'system@', 'admin@', 'support@',
-  ];
-  for (const pattern of automatedPatterns) {
-    if (fromLower.includes(pattern)) {
-      return { skip: true, reason: `automated address (${pattern})` };
-    }
-  }
-
-  // Skip marketing/newsletter subjects
-  const marketingSubjects = [
-    'subscription confirmed', 'you\'re subscribed', 'welcome to',
-    'thank you for signing up', 'price alert', 'price drop',
-    'similar vehicles', 'new listings', 'unsubscribe',
-    'weekly digest', 'daily digest', 'newsletter',
-  ];
-  for (const pattern of marketingSubjects) {
-    if (subjectLower.includes(pattern)) {
-      return { skip: true, reason: `marketing email (${pattern})` };
-    }
-  }
-
-  return { skip: false, reason: '' };
-}
 
 /**
  * Get the workspace directory name for a listing
@@ -140,9 +101,25 @@ ${analysis.recommendation || 'No recommendation available.'}
     }
   }
 
-  // Copy CARFAX if exists
+  // Copy CARFAX if exists (could be a PDF file or a directory of images)
   if (listing.carfaxPath && fs.existsSync(listing.carfaxPath)) {
-    fs.copyFileSync(listing.carfaxPath, path.join(listingDir, 'carfax.pdf'));
+    const carfaxStat = fs.statSync(listing.carfaxPath);
+    if (carfaxStat.isDirectory()) {
+      // It's a directory of CARFAX images - copy all files
+      const carfaxImagesDir = path.join(listingDir, 'carfax-images');
+      fs.mkdirSync(carfaxImagesDir, { recursive: true });
+      const files = fs.readdirSync(listing.carfaxPath);
+      for (const file of files) {
+        const srcPath = path.join(listing.carfaxPath, file);
+        const destPath = path.join(carfaxImagesDir, file);
+        if (fs.statSync(srcPath).isFile()) {
+          fs.copyFileSync(srcPath, destPath);
+        }
+      }
+    } else {
+      // It's a PDF file
+      fs.copyFileSync(listing.carfaxPath, path.join(listingDir, 'carfax.pdf'));
+    }
   }
 
   if (listing.carfaxSummary) {
@@ -468,6 +445,8 @@ export const smartRespondCommand = new Command('smart-respond')
   .option('--dry-run', 'Analyze emails but don\'t send responses')
   .option('--limit <n>', 'Max emails to process', '10')
   .option('--debug', 'Enable debug logging')
+  .option('--include-read', 'Also check read emails (reprocess previously seen emails)')
+  .option('--since <days>', 'Only check emails from last N days when using --include-read', '3')
   .action(async (options) => {
     try {
       const db = getDatabase();
@@ -475,26 +454,34 @@ export const smartRespondCommand = new Command('smart-respond')
       const dryRun = options.dryRun ?? false;
       const limit = parseInt(options.limit);
       const debug = options.debug ?? false;
+      const includeRead = options.includeRead ?? false;
+      const sinceDays = parseInt(options.since);
 
       console.log('\n🤖 Smart Auto-Respond\n');
-      console.log('Checking for new emails...');
+      if (includeRead) {
+        console.log(`Checking all emails from last ${sinceDays} days (including read)...`);
+      } else {
+        console.log('Checking for new emails...');
+      }
 
       // Ensure workspace exists
       fs.mkdirSync(LISTINGS_DIR, { recursive: true });
 
-      // Fetch new emails
-      const emails = await emailClient.fetchNewEmails();
+      // Fetch emails - optionally include read emails
+      const since = includeRead ? new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000) : undefined;
+      const emails = await emailClient.fetchNewEmails(since, includeRead);
 
       if (emails.length === 0) {
-        console.log('No new emails to process.');
+        console.log(includeRead ? 'No emails found in the specified time range.' : 'No new emails to process.');
         emailClient.close();
         return;
       }
 
-      console.log(`Found ${emails.length} new email(s)\n`);
+      console.log(`Found ${emails.length} email(s) to process\n`);
 
-      // Get contacted listings for matching
-      const contactedListings = db.listListings({ status: 'contacted', limit: 100 });
+      // Get all active listings for matching (emails can come for any active listing, not just 'contacted')
+      const activeStatuses = ['contacted', 'awaiting_response', 'negotiating', 'viewing_scheduled', 'inspected'] as const;
+      const contactedListings = db.listListings({ status: activeStatuses as any, limit: 200 });
 
       // Build cross-listing context once
       const crossListingContext = buildCrossListingContext(db);
@@ -503,16 +490,36 @@ export const smartRespondCommand = new Command('smart-respond')
       let responded = 0;
       let skipped = 0;
       let sold = 0;
+      let duplicates = 0;
+
+      // Pre-load processed email IDs for efficiency
+      const processedEmailIds = db.getProcessedEmailIds();
 
       for (const email of emails.slice(0, limit)) {
         console.log('─'.repeat(70));
         console.log(`From: ${email.from}`);
         console.log(`Subject: ${email.subject}`);
 
+        // Check for duplicate (already processed email)
+        if (email.messageId && processedEmailIds.has(email.messageId)) {
+          console.log(`⏭️  Already processed (duplicate) - skipping`);
+          duplicates++;
+          continue;
+        }
+
         // Check if we should skip this email
         const skipCheck = shouldSkipEmail(email);
         if (skipCheck.skip) {
           console.log(`⏭️  Skipping: ${skipCheck.reason}`);
+          // Mark as processed even if skipped, so we don't check it again
+          if (email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: `skipped: ${skipCheck.reason}`,
+            });
+          }
           skipped++;
           continue;
         }
@@ -529,6 +536,15 @@ export const smartRespondCommand = new Command('smart-respond')
 
         if (!matchedListing) {
           console.log('❓ Could not match to any listing - skipping');
+          // Mark as processed so we don't re-check this email
+          if (email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: 'skipped: no matching listing',
+            });
+          }
           skipped++;
           continue;
         }
@@ -542,9 +558,21 @@ export const smartRespondCommand = new Command('smart-respond')
         // Save inbound email to workspace
         saveEmailToWorkspace(listingDir, email, 'inbound');
 
-        // Check for attachments - list all PDFs, not just ones with "carfax" in name
+        // Log all attachments for debugging
+        if (email.attachments.length > 0) {
+          console.log(`   📎 ${email.attachments.length} attachment(s):`);
+          for (const att of email.attachments) {
+            const sizeKb = Math.round(att.content.length / 1024);
+            console.log(`      - ${att.filename} (${att.contentType}, ${sizeKb}KB)`);
+          }
+        }
+
+        // Check for attachments - PDFs and images
         const pdfAttachments = email.attachments.filter(
           a => a.contentType === 'application/pdf'
+        );
+        const imageAttachments = email.attachments.filter(
+          a => a.contentType.startsWith('image/') && a.content.length > 50000 // >50KB = likely real photo, not signature
         );
 
         // Build attachment info string for Claude
@@ -552,7 +580,8 @@ export const smartRespondCommand = new Command('smart-respond')
         if (email.attachments.length > 0) {
           attachmentInfo = '\n## Attachments in this email\n';
           for (const att of email.attachments) {
-            attachmentInfo += `- ${att.filename} (${att.contentType})\n`;
+            const sizeKb = Math.round(att.content.length / 1024);
+            attachmentInfo += `- ${att.filename} (${att.contentType}, ${sizeKb}KB)\n`;
           }
         }
 
@@ -564,6 +593,19 @@ export const smartRespondCommand = new Command('smart-respond')
                a.filename.toLowerCase().includes('vehicle')
         );
 
+        // Check if images might be CARFAX pages (multiple large images or name contains carfax)
+        const carfaxImages = imageAttachments.filter(
+          a => a.filename.toLowerCase().includes('carfax') ||
+               a.filename.toLowerCase().includes('history') ||
+               a.filename.toLowerCase().includes('report') ||
+               a.filename.toLowerCase().includes('page')
+        );
+        const hasCarfaxImages = carfaxImages.length > 0 ||
+          (imageAttachments.length >= 2 &&
+           (email.text.toLowerCase().includes('carfax') ||
+            email.text.toLowerCase().includes('report') ||
+            email.text.toLowerCase().includes('history')));
+
         // If no name match but there's a PDF and email mentions carfax/report, assume it's the report
         const possibleCarfax = carfaxAttachment || (
           pdfAttachments.length > 0 &&
@@ -574,8 +616,10 @@ export const smartRespondCommand = new Command('smart-respond')
         ) ? pdfAttachments[0] : null;
 
         let carfaxJustReceived = false;
+
+        // Save PDF CARFAX
         if (possibleCarfax) {
-          console.log(`📄 Vehicle report detected: ${possibleCarfax.filename} - saving...`);
+          console.log(`   📄 Vehicle report PDF detected: ${possibleCarfax.filename} - saving...`);
           const carfaxDir = path.join('data', 'carfax');
           fs.mkdirSync(carfaxDir, { recursive: true });
           const carfaxPath = path.join(carfaxDir, `listing-${matchedListing.id}.pdf`);
@@ -586,13 +630,51 @@ export const smartRespondCommand = new Command('smart-respond')
             carfaxReceived: true,
             carfaxPath,
           });
-          console.log(`   Saved: ${carfaxPath}`);
+          console.log(`      Saved: ${carfaxPath}`);
           carfaxJustReceived = true;
 
           // Also write a note about receiving it
           const carfaxNote = `\n## CARFAX/Vehicle Report\n\n**Just received with this email:** ${possibleCarfax.filename}\n\nThe PDF has been saved but not yet analyzed. Treat this as CARFAX received.`;
           fs.writeFileSync(path.join(listingDir, 'carfax-received.md'), carfaxNote);
-          attachmentInfo += `\n**NOTE: Vehicle history report received and saved.**\n`;
+          attachmentInfo += `\n**NOTE: Vehicle history report (PDF) received and saved.**\n`;
+        }
+
+        // Save CARFAX images if detected
+        if (!carfaxJustReceived && hasCarfaxImages) {
+          console.log(`   📄 Vehicle report IMAGES detected (${imageAttachments.length} images) - saving...`);
+          const carfaxDir = path.join('data', 'carfax');
+          const imagesDir = path.join(carfaxDir, `listing-${matchedListing.id}-images`);
+          fs.mkdirSync(imagesDir, { recursive: true });
+
+          let imageNum = 1;
+          for (const img of imageAttachments) {
+            const ext = img.contentType.split('/')[1] || 'jpg';
+            const imgPath = path.join(imagesDir, `page-${String(imageNum).padStart(2, '0')}.${ext}`);
+            fs.writeFileSync(imgPath, img.content);
+            console.log(`      Saved: ${imgPath}`);
+            imageNum++;
+          }
+
+          // Also copy to workspace
+          const workspaceImagesDir = path.join(listingDir, 'carfax-images');
+          fs.mkdirSync(workspaceImagesDir, { recursive: true });
+          imageNum = 1;
+          for (const img of imageAttachments) {
+            const ext = img.contentType.split('/')[1] || 'jpg';
+            const imgPath = path.join(workspaceImagesDir, `page-${String(imageNum).padStart(2, '0')}.${ext}`);
+            fs.writeFileSync(imgPath, img.content);
+            imageNum++;
+          }
+
+          db.updateListing(matchedListing.id, {
+            carfaxReceived: true,
+            carfaxPath: imagesDir,
+          });
+          carfaxJustReceived = true;
+
+          const carfaxNote = `\n## CARFAX/Vehicle Report\n\n**Just received as ${imageAttachments.length} image(s) with this email.**\n\nImages saved to: ${imagesDir}\n\nTreat this as CARFAX received - review the images manually.`;
+          fs.writeFileSync(path.join(listingDir, 'carfax-received.md'), carfaxNote);
+          attachmentInfo += `\n**NOTE: Vehicle history report (${imageAttachments.length} images) received and saved.**\n`;
         }
 
         // Process links in email
@@ -739,6 +821,17 @@ export const smartRespondCommand = new Command('smart-respond')
           console.log('   Email saved to workspace for manual review');
         }
 
+        // Mark email as processed to prevent reprocessing
+        if (email.messageId) {
+          db.markEmailProcessed({
+            messageId: email.messageId,
+            listingId: matchedListing.id,
+            fromAddress: email.from,
+            subject: email.subject,
+            action: 'processed',
+          });
+        }
+
         processed++;
       }
 
@@ -748,6 +841,7 @@ export const smartRespondCommand = new Command('smart-respond')
       console.log('Smart Respond Summary:');
       console.log(`  Processed: ${processed}`);
       console.log(`  Responded: ${responded}`);
+      console.log(`  Duplicates: ${duplicates}`);
       console.log(`  Skipped: ${skipped}`);
       console.log(`  Marked Sold: ${sold}`);
 

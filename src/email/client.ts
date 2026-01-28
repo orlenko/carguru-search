@@ -23,6 +23,7 @@ export interface EmailConfig {
 
 export interface IncomingEmail {
   id: string;
+  messageId: string | null;  // RFC Message-ID header for deduplication
   from: string;
   to: string;
   subject: string;
@@ -106,8 +107,10 @@ export class EmailClient {
 
   /**
    * Fetch new emails from inbox
+   * @param since - Only fetch emails since this date
+   * @param includeRead - If true, also fetch read emails (not just UNSEEN)
    */
-  async fetchNewEmails(since?: Date): Promise<IncomingEmail[]> {
+  async fetchNewEmails(since?: Date, includeRead: boolean = false): Promise<IncomingEmail[]> {
     return new Promise((resolve, reject) => {
       const imap = new Imap({
         user: this.config.user,
@@ -128,8 +131,8 @@ export class EmailClient {
             return;
           }
 
-          // Search for unseen emails, optionally since a date
-          const searchCriteria: any[] = ['UNSEEN'];
+          // Search for emails - either unseen only or all (if includeRead)
+          const searchCriteria: any[] = includeRead ? ['ALL'] : ['UNSEEN'];
           if (since) {
             searchCriteria.push(['SINCE', since]);
           }
@@ -290,6 +293,7 @@ export class EmailClient {
 
     return {
       id,
+      messageId: parsed.messageId || null,  // RFC Message-ID for deduplication
       from: fromText,
       to: toText,
       subject: parsed.subject || '',

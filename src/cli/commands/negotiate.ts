@@ -10,40 +10,7 @@ import {
   type NegotiationContext,
 } from '../../negotiation/negotiator.js';
 import { EmailClient } from '../../email/client.js';
-
-/**
- * Check if an email should be skipped (automated, noreply, marketing, etc.)
- */
-function shouldSkipEmail(email: { from: string; subject: string; text: string }): { skip: boolean; reason: string } {
-  const fromLower = email.from.toLowerCase();
-  const subjectLower = email.subject.toLowerCase();
-
-  if (fromLower.includes('noreply') || fromLower.includes('no-reply') || fromLower.includes('donotreply')) {
-    return { skip: true, reason: 'noreply address' };
-  }
-
-  const automatedPatterns = [
-    'mailer-daemon', 'postmaster', 'autoresponder', 'auto-reply', 'automated',
-    'notification@', 'notifications@', 'alert@', 'alerts@', 'system@',
-  ];
-  for (const pattern of automatedPatterns) {
-    if (fromLower.includes(pattern)) {
-      return { skip: true, reason: 'automated address' };
-    }
-  }
-
-  const marketingSubjects = [
-    'subscription confirmed', 'you\'re subscribed', 'welcome to', 'thank you for signing up',
-    'price alert', 'price drop', 'similar vehicles', 'new listings', 'unsubscribe',
-  ];
-  for (const pattern of marketingSubjects) {
-    if (subjectLower.includes(pattern)) {
-      return { skip: true, reason: 'marketing email' };
-    }
-  }
-
-  return { skip: false, reason: '' };
-}
+import { shouldSkipEmail } from '../../email/filters.js';
 
 // Safety limits for auto-send mode
 const AUTO_SEND_DEFAULTS = {
@@ -321,7 +288,7 @@ export const autoNegotiateCommand = new Command('auto-negotiate')
       console.log(`Found ${emails.length} new email(s)\n`);
 
       // Get listings that are in negotiation or contacted
-      const listings = db.listListings({ status: ['contacted', 'interesting'] as any, limit: 100 });
+      const listings = db.listListings({ status: ['contacted', 'awaiting_response', 'negotiating'] as any, limit: 100 });
       const maxExchanges = parseInt(options.maxExchanges, 10);
 
       let processed = 0;

@@ -60,9 +60,10 @@ export const searchCommand = new Command('search')
               // Check if price changed
               if (existing.price !== listing.price && listing.price) {
                 db.recordPriceChange(existing.id, listing.price);
-                db.updateListing(existing.id, { price: listing.price });
                 updatedCount++;
               }
+              // Always upsert to update description, features, photos, etc.
+              db.upsertListing(listing);
             } else {
               db.upsertListing(listing);
               newCount++;
