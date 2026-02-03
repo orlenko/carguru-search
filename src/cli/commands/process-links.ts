@@ -13,6 +13,7 @@ import {
   type ExtractedLink,
 } from '../../email/link-processor.js';
 import { EmailClient } from '../../email/client.js';
+import { writeSearchContext, WORKSPACE_DIR } from '../../workspace/index.js';
 
 export const processLinksCommand = new Command('process-links')
   .description('Extract and analyze links from dealer emails')
@@ -31,7 +32,8 @@ export const processLinksCommand = new Command('process-links')
         return;
       }
 
-      const result = await fetchAndAnalyzeLink(options.url);
+      writeSearchContext();
+      const result = await fetchAndAnalyzeLink(options.url, WORKSPACE_DIR);
       if (result) {
         console.log('📄 Analysis Results:\n');
         console.log(`  Title:       ${result.title}`);

@@ -4,7 +4,7 @@ Fully automated used car search and negotiation system. Find, contact, and negot
 
 ## Features
 
-- **Automated Discovery**: Scrape AutoTrader and CarGurus for vehicles matching your criteria
+- **Automated Discovery**: Scrape AutoTrader for vehicles matching your criteria
 - **AI Analysis**: Claude-powered analysis of listings detecting red flags, pricing issues, and deception
 - **Smart Ranking**: Composite scoring based on price, mileage, condition, and AI assessment
 - **Automated Outreach**: Contact dealers via web forms automatically
@@ -139,9 +139,9 @@ npm run dev -- inbox                       # See all active conversations
 ### Discovery
 ```bash
 npm run dev -- search                      # Search AutoTrader
-npm run dev -- search --source cargurus    # Search CarGurus
+npm run dev -- search                      # Search AutoTrader
 npm run dev -- list                        # List all discoveries
-npm run dev -- list --status interesting   # Filter by status
+npm run dev -- list --status analyzed      # Filter by status
 npm run dev -- show <id>                   # View listing details
 npm run dev -- stats                       # View statistics
 ```
@@ -232,8 +232,8 @@ The following are **never committed** to git:
 Listings progress through these statuses:
 
 ```
-new → interesting → contacted → carfax_requested → carfax_received → analyzed → shortlisted
-                 ↘ rejected
+discovered → analyzed → contacted → awaiting_response → negotiating → viewing_scheduled → inspected → offer_made → purchased
+                                                ↘ rejected / withdrawn
 ```
 
 ## License

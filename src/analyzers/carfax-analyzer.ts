@@ -1,8 +1,11 @@
-import { readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { execAsync } from './listing-analyzer.js';
+import { readFileSync } from 'fs';
+import fs from 'fs';
+import path from 'path';
 import { createRequire } from 'module';
+import { runClaudeTask } from '../claude/task-runner.js';
+import { writeSearchContext } from '../workspace/index.js';
+
+const CLAUDE_SENTINEL = 'task complete';
 
 // pdf-parse doesn't have proper ESM support, use require
 const require = createRequire(import.meta.url);
@@ -197,17 +200,42 @@ Risk level guidelines:
 
 Respond ONLY with the JSON object, no other text.`;
 
-  const promptFile = join(tmpdir(), `carfax-prompt-${Date.now()}.txt`);
-  writeFileSync(promptFile, prompt);
-
   try {
-    const { stdout } = await execAsync(
-      `cat "${promptFile}" | claude --print --model haiku`,
-      { timeout: 120000, maxBuffer: 1024 * 1024 }
-    );
+    writeSearchContext();
+    const workspaceDir = path.resolve('workspace');
+    const taskDir = path.join(workspaceDir, 'claude', `carfax-analysis-${Date.now()}`);
+    fs.mkdirSync(taskDir, { recursive: true });
+    const taskFile = path.join(taskDir, 'task.md');
+    const resultFile = path.join(taskDir, 'result.json');
+    const resultRel = path.relative(workspaceDir, resultFile);
 
-    // Extract JSON from response
-    const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+    const taskBody = `${prompt}
+
+---
+
+Write ONLY the JSON to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+    fs.writeFileSync(taskFile, taskBody);
+
+    await runClaudeTask({
+      workspaceDir,
+      taskFile: path.relative(workspaceDir, taskFile),
+      resultFile: resultRel,
+      model: process.env.CLAUDE_MODEL_CARFAX || process.env.CLAUDE_MODEL || undefined,
+      dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+      timeoutMs: 120000,
+      sentinel: CLAUDE_SENTINEL,
+    });
+
+    if (!fs.existsSync(resultFile)) {
+      throw new Error('Claude did not write a result file');
+    }
+
+    const raw = fs.readFileSync(resultFile, 'utf-8');
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       throw new Error('No JSON found in AI response');
     }
@@ -224,12 +252,6 @@ Respond ONLY with the JSON object, no other text.`;
   } catch (error) {
     // Fallback to rule-based analysis if AI fails
     return generateFallbackAnalysis(data);
-  } finally {
-    try {
-      unlinkSync(promptFile);
-    } catch {
-      // Ignore cleanup errors
-    }
   }
 }
 

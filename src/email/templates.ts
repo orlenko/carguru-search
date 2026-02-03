@@ -1,5 +1,11 @@
 import type { Listing } from '../database/client.js';
 import { getEnv } from '../config.js';
+import * as fs from 'fs';
+import path from 'path';
+import { runClaudeTask } from '../claude/task-runner.js';
+import { syncListingToWorkspace, writeSearchContext } from '../workspace/index.js';
+
+const CLAUDE_SENTINEL = 'task complete';
 
 export type EmailTemplate =
   | 'initial_inquiry'
@@ -124,13 +130,6 @@ export async function generateAIResponse(
   listing: Listing,
   context: string
 ): Promise<string> {
-  const { exec } = await import('child_process');
-  const { promisify } = await import('util');
-  const { writeFileSync, unlinkSync } = await import('fs');
-  const { tmpdir } = await import('os');
-  const { join } = await import('path');
-
-  const execAsync = promisify(exec);
   const buyerName = getEnv('BUYER_NAME', false) || 'Buyer';
   const vehicle = `${listing.year} ${listing.make} ${listing.model}`;
 
@@ -156,25 +155,50 @@ Write a brief, professional response that:
 
 Keep it concise - dealers are busy. Just the email body, no subject line.`;
 
-  const promptFile = join(tmpdir(), `email-response-${Date.now()}.txt`);
-  writeFileSync(promptFile, prompt);
-
   try {
-    const { stdout } = await execAsync(
-      `cat "${promptFile}" | claude --print --model haiku`,
-      { timeout: 120000, maxBuffer: 1024 * 1024 }
-    );
-    return stdout.trim();
+    writeSearchContext();
+    const listingDir = syncListingToWorkspace(listing);
+    const taskDir = path.join(listingDir, 'claude', `email-response-${Date.now()}`);
+    fs.mkdirSync(taskDir, { recursive: true });
+    const taskFile = path.join(taskDir, 'task.md');
+    const resultFile = path.join(taskDir, 'result.txt');
+    const resultRel = path.relative(listingDir, resultFile);
+
+    const taskBody = `${prompt}
+
+---
+
+Write ONLY the email body to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+    fs.writeFileSync(taskFile, taskBody);
+
+    await runClaudeTask({
+      workspaceDir: listingDir,
+      taskFile: path.relative(listingDir, taskFile),
+      resultFile: resultRel,
+      model: process.env.CLAUDE_MODEL_EMAIL || process.env.CLAUDE_MODEL || undefined,
+      dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+      timeoutMs: 120000,
+      sentinel: CLAUDE_SENTINEL,
+    });
+
+    if (!fs.existsSync(resultFile)) {
+      throw new Error('Claude did not write a result file');
+    }
+
+    const output = fs.readFileSync(resultFile, 'utf-8').trim();
+    if (output) {
+      return output;
+    }
   } catch (error) {
     // Fallback response if AI fails
     return `Thank you for your response regarding the ${vehicle}. I remain interested and would like to proceed with scheduling a viewing at your earliest convenience.\n\nBest regards,\n${buyerName}`;
-  } finally {
-    try {
-      unlinkSync(promptFile);
-    } catch {
-      // Ignore cleanup errors
-    }
   }
+  // Fallback if Claude returned empty
+  return `Thank you for your response regarding the ${vehicle}. I remain interested and would like to proceed with scheduling a viewing at your earliest convenience.\n\nBest regards,\n${buyerName}`;
 }
 
 /**

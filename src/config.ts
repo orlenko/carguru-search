@@ -16,7 +16,6 @@ const SearchConfigSchema = z.object({
   priceMax: z.number().optional(),
   postalCode: z.string(),
   radiusKm: z.number().default(100),
-  sites: z.array(z.string()).default(['cargurus']),
 });
 
 const ScoringConfigSchema = z.object({
@@ -35,21 +34,6 @@ const ScoringConfigSchema = z.object({
     maxOwners: z.number().default(3),
   }).default({}),
 });
-
-const EmailConfigSchema = z.object({
-  fromName: z.string(),
-  fromEmail: z.string().email(),
-  imap: z.object({
-    host: z.string(),
-    port: z.number(),
-    secure: z.boolean().default(true),
-  }),
-  smtp: z.object({
-    host: z.string(),
-    port: z.number(),
-    secure: z.boolean().default(false),
-  }),
-}).optional();
 
 const CheckpointsConfigSchema = z.object({
   // Require approval before sending offers above this amount
@@ -82,7 +66,6 @@ const ConfigSchema = z.object({
     dealBreakers: [],
     preferences: {},
   }),
-  email: EmailConfigSchema,
   checkpoints: CheckpointsConfigSchema,
   privateNotes: z.string().optional(),
 });

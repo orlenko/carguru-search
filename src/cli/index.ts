@@ -25,6 +25,7 @@ import { costCommand, costAllCommand } from './commands/cost.js';
 import { processLinksCommand } from './commands/process-links.js';
 import { emailFollowupCommand } from './commands/email-followup.js';
 import { rankOffersCommand, aiRankCommand } from './commands/rank-offers.js';
+import { healthCommand } from './commands/health.js';
 
 const program = new Command();
 
@@ -107,5 +108,8 @@ program.addCommand(emailFollowupCommand);
 // Ranking commands
 program.addCommand(rankOffersCommand);
 program.addCommand(aiRankCommand);
+
+// Health check
+program.addCommand(healthCommand);
 
 program.parse();

@@ -9,182 +9,11 @@ import { EmailClient, saveEmailAttachments } from '../../email/client.js';
 import { extractLinksFromEmail, filterRelevantLinks, processEmailLinks } from '../../email/link-processor.js';
 import { shouldSkipEmail } from '../../email/filters.js';
 import { analyzeCarfaxBuffer } from '../../analyzers/carfax-analyzer.js';
-import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Listing, ConversationMessage } from '../../database/client.js';
-
-const WORKSPACE_DIR = 'workspace';
-const LISTINGS_DIR = path.join(WORKSPACE_DIR, 'listings');
-
-/**
- * Get the workspace directory name for a listing
- */
-function getListingDirName(listing: { id: number; year: number; make: string; model: string }): string {
-  const slug = `${listing.year}-${listing.make}-${listing.model}`
-    .toLowerCase()
-    .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9-]/g, '');
-  return `${String(listing.id).padStart(3, '0')}-${slug}`;
-}
-
-/**
- * Sync listing and all correspondence to workspace
- */
-function syncListingWorkspace(listing: Listing): string {
-  const dirName = getListingDirName(listing);
-  const listingDir = path.join(LISTINGS_DIR, dirName);
-  const emailsDir = path.join(listingDir, 'emails');
-  const attachmentsDir = path.join(listingDir, 'attachments');
-
-  fs.mkdirSync(emailsDir, { recursive: true });
-  fs.mkdirSync(attachmentsDir, { recursive: true });
-
-  // Write comprehensive listing.md
-  const specs = listing.specs || {};
-  const listingMd = `# ${listing.year} ${listing.make} ${listing.model}
-
-## Vehicle Details
-
-| Field | Value |
-|-------|-------|
-| **Price** | $${listing.price?.toLocaleString() || 'N/A'} |
-| **Mileage** | ${listing.mileageKm?.toLocaleString() || 'N/A'} km |
-| **VIN** | ${listing.vin || 'Not available'} |
-| **Status** | ${listing.status} |
-| **Score** | ${listing.score ?? 'Not scored'}/100 |
-
-## Seller Information
-
-| Field | Value |
-|-------|-------|
-| **Name** | ${listing.sellerName || 'Unknown'} |
-| **Type** | ${listing.sellerType || 'Unknown'} |
-| **Phone** | ${listing.sellerPhone || 'N/A'} |
-| **Email** | ${listing.sellerEmail || 'N/A'} |
-| **Location** | ${listing.city || ''}${listing.city && listing.province ? ', ' : ''}${listing.province || 'N/A'} |
-| **Distance** | ${listing.distanceKm ?? 'N/A'} km |
-
-## Vehicle Specifications
-
-${Object.keys(specs).length > 0 ? Object.entries(specs).map(([k, v]) => `- **${k}:** ${v}`).join('\n') : 'No specifications available.'}
-
-## Listing URL
-
-${listing.sourceUrl}
-
-## Description
-
-${listing.description || 'No description available.'}
-
-## Red Flags
-
-${listing.redFlags?.map(f => `- ⚠️ ${f}`).join('\n') || 'None identified'}
-
-## Notes
-
-${listing.notes || 'None'}
-`;
-
-  fs.writeFileSync(path.join(listingDir, 'listing.md'), listingMd);
-
-  // Write AI analysis if available
-  if (listing.aiAnalysis) {
-    try {
-      const analysis = JSON.parse(listing.aiAnalysis);
-      const analysisMd = `# AI Analysis
-
-## Summary
-
-${analysis.summary || 'No summary available.'}
-
-## Score: ${analysis.recommendationScore ?? 'N/A'}/100
-
-**Condition:** ${analysis.estimatedCondition || 'Unknown'}
-
-## Positives
-
-${analysis.positives?.map((p: string) => `- ✅ ${p}`).join('\n') || 'None identified'}
-
-## Concerns
-
-${analysis.concerns?.map((c: string) => `- ⚠️ ${c}`).join('\n') || 'None identified'}
-
-## Pricing Analysis
-
-${analysis.pricing ? `
-- **Type:** ${analysis.pricing.pricingType}
-- **Certification:** ${analysis.pricing.certificationStatus}
-${analysis.pricing.mentionedFees?.length > 0 ? `- **Fees:** ${analysis.pricing.mentionedFees.map((f: any) => `${f.name}: $${f.amount || '?'}`).join(', ')}` : ''}
-` : 'No pricing analysis available.'}
-`;
-      fs.writeFileSync(path.join(listingDir, 'analysis.md'), analysisMd);
-    } catch {}
-  }
-
-  // Copy CARFAX
-  if (listing.carfaxPath && fs.existsSync(listing.carfaxPath)) {
-    fs.copyFileSync(listing.carfaxPath, path.join(listingDir, 'carfax.pdf'));
-  }
-
-  if (listing.carfaxSummary) {
-    const carfaxMd = `# CARFAX Summary
-
-${listing.carfaxSummary}
-
-## Key Data
-
-- **Accidents:** ${listing.accidentCount ?? 'Unknown'}
-- **Previous Owners:** ${listing.ownerCount ?? 'Unknown'}
-- **Service Records:** ${listing.serviceRecordCount ?? 'Unknown'}
-`;
-    fs.writeFileSync(path.join(listingDir, 'carfax-summary.md'), carfaxMd);
-  }
-
-  // Write conversation history
-  if (listing.sellerConversation && listing.sellerConversation.length > 0) {
-    let conversationMd = `# Conversation History
-
-`;
-    for (const msg of listing.sellerConversation) {
-      const icon = msg.direction === 'outbound' ? '📤' : '📥';
-      const label = msg.direction === 'outbound' ? 'SENT' : 'RECEIVED';
-      conversationMd += `## ${icon} ${label}: ${msg.date}
-
-**Channel:** ${msg.channel}
-${msg.subject ? `**Subject:** ${msg.subject}` : ''}
-
----
-
-${msg.body}
-
----
-
-`;
-    }
-    fs.writeFileSync(path.join(listingDir, 'conversation.md'), conversationMd);
-
-    // Also write individual emails
-    let emailNum = 1;
-    for (const msg of listing.sellerConversation) {
-      const dateStr = msg.date.split('T')[0];
-      const filename = `${String(emailNum).padStart(2, '0')}-${msg.direction}-${dateStr}.md`;
-      const emailMd = `# ${msg.direction === 'outbound' ? 'Sent' : 'Received'}: ${msg.date}
-
-**Channel:** ${msg.channel}
-${msg.subject ? `**Subject:** ${msg.subject}` : ''}
-
----
-
-${msg.body}
-`;
-      fs.writeFileSync(path.join(emailsDir, filename), emailMd);
-      emailNum++;
-    }
-  }
-
-  return listingDir;
-}
+import { matchListingFromEmail } from '../../email/matching.js';
+import { syncListingToWorkspace, writeSearchContext } from '../../workspace/index.js';
 
 export const emailFollowupCommand = new Command('email-followup')
   .description('Flow 2: Check emails and follow up with Claude-powered responses')
@@ -238,7 +67,8 @@ export const emailFollowupCommand = new Command('email-followup')
 
     try {
       const emailClient = new EmailClient();
-      fs.mkdirSync(LISTINGS_DIR, { recursive: true });
+      writeSearchContext();
+      const processedEmailIds = db.getProcessedEmailIds();
 
       // Get listings to check
       let listingsToCheck: Listing[];
@@ -279,19 +109,25 @@ export const emailFollowupCommand = new Command('email-followup')
       let responded = 0;
 
       for (const email of emails) {
+        if (email.messageId && processedEmailIds.has(email.messageId)) {
+          continue;
+        }
+
         if (shouldSkipEmail(email).skip) {
+          if (!options.dryRun && email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: 'skipped',
+            });
+            processedEmailIds.add(email.messageId);
+          }
           continue;
         }
 
         // Try to match to a listing
-        const matchedListing = listingsToCheck.find(listing => {
-          if (listing.sellerEmail && email.from.toLowerCase().includes(listing.sellerEmail.toLowerCase())) return true;
-          if (listing.sellerName && email.from.toLowerCase().includes(listing.sellerName.toLowerCase())) return true;
-          const vehicle = `${listing.make} ${listing.model}`.toLowerCase();
-          if (email.subject.toLowerCase().includes(vehicle)) return true;
-          if (email.text.toLowerCase().includes(vehicle)) return true;
-          return false;
-        });
+        const matchedListing = matchListingFromEmail(email, listingsToCheck);
 
         if (!matchedListing) continue;
 
@@ -303,7 +139,7 @@ export const emailFollowupCommand = new Command('email-followup')
         console.log(`   Subject: ${email.subject}`);
 
         // Sync workspace
-        const listingDir = syncListingWorkspace(matchedListing);
+        const listingDir = syncListingToWorkspace(matchedListing);
 
         // Save email attachments
         if (email.attachments.length > 0) {
@@ -334,6 +170,7 @@ export const emailFollowupCommand = new Command('email-followup')
             db.updateListing(matchedListing.id, {
               carfaxReceived: true,
               carfaxPath,
+              infoStatus: 'carfax_received',
               accidentCount: analysis.data.accidentCount,
               ownerCount: analysis.data.ownerCount,
               serviceRecordCount: analysis.data.serviceRecordCount,
@@ -341,7 +178,11 @@ export const emailFollowupCommand = new Command('email-followup')
             });
             console.log(`   ✅ CARFAX analyzed: ${analysis.riskLevel} risk`);
           } catch (e) {
-            db.updateListing(matchedListing.id, { carfaxReceived: true, carfaxPath });
+            db.updateListing(matchedListing.id, {
+              carfaxReceived: true,
+              carfaxPath,
+              infoStatus: 'carfax_received',
+            });
             console.log(`   ⚠️ CARFAX saved but analysis failed`);
           }
         }
@@ -373,8 +214,16 @@ export const emailFollowupCommand = new Command('email-followup')
         db.updateListing(matchedListing.id, {
           sellerConversation: [...existingConversation, newMessage],
           lastSellerResponseAt: new Date().toISOString(),
-          status: 'negotiating',
         });
+        if (!options.dryRun) {
+          const transitionResult = db.transitionStatePath(matchedListing.id, 'negotiating', {
+            triggeredBy: 'system',
+            reasoning: 'Received seller response',
+          });
+          if (!transitionResult.success) {
+            console.log(`   ⚠️ State transition failed: ${transitionResult.error}`);
+          }
+        }
 
         // Log audit
         db.logAudit({
@@ -393,17 +242,38 @@ export const emailFollowupCommand = new Command('email-followup')
 
         if (options.checkOnly) {
           console.log('   ℹ️ Check-only mode - no response generated');
+          if (!options.dryRun && email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              listingId: matchedListing.id,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: 'checked_only',
+            });
+            processedEmailIds.add(email.messageId);
+          }
           continue;
         }
 
         // Re-sync workspace with updated data
         const refreshedListing = db.getListing(matchedListing.id);
         if (refreshedListing) {
-          syncListingWorkspace(refreshedListing);
+          syncListingToWorkspace(refreshedListing);
         }
 
         console.log(`   📁 Workspace synced: ${listingDir}`);
         console.log(`   💡 Run: npm run dev -- ask-claude ${matchedListing.id}`);
+
+        if (!options.dryRun && email.messageId) {
+          db.markEmailProcessed({
+            messageId: email.messageId,
+            listingId: matchedListing.id,
+            fromAddress: email.from,
+            subject: email.subject,
+            action: 'processed',
+          });
+          processedEmailIds.add(email.messageId);
+        }
       }
 
       emailClient.close();

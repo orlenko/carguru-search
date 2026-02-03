@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS listings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
 
   -- Source information
-  source TEXT NOT NULL,              -- 'cargurus', 'autotrader', 'kijiji'
+  source TEXT NOT NULL,              -- 'autotrader', 'kijiji'
   sourceId TEXT NOT NULL,            -- ID on the source site
   sourceUrl TEXT NOT NULL,           -- Full URL to listing
 
@@ -320,6 +320,9 @@ export const MIGRATIONS = [
   `ALTER TABLE listings ADD COLUMN contactedAt TEXT`,
   // Vehicle specifications (JSON)
   `ALTER TABLE listings ADD COLUMN specs TEXT`,
+  // Legacy status normalization
+  `UPDATE listings SET status = 'discovered' WHERE status = 'new'`,
+  `UPDATE listings SET status = 'analyzed' WHERE status = 'interesting'`,
 ];
 
 /**

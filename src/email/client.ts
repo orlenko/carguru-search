@@ -65,6 +65,7 @@ const DEFAULT_CONFIG: Omit<EmailConfig, 'user' | 'password'> = {
 export class EmailClient {
   private config: EmailConfig;
   private transporter: nodemailer.Transporter | null = null;
+  private allowSelfSigned: boolean;
 
   constructor(config?: Partial<EmailConfig>) {
     this.config = {
@@ -73,6 +74,7 @@ export class EmailClient {
       imap: config?.imap || DEFAULT_CONFIG.imap,
       smtp: config?.smtp || DEFAULT_CONFIG.smtp,
     };
+    this.allowSelfSigned = (getEnv('IMAP_ALLOW_SELF_SIGNED', false) || '').toLowerCase() === 'true';
   }
 
   /**
@@ -118,7 +120,7 @@ export class EmailClient {
         host: this.config.imap.host,
         port: this.config.imap.port,
         tls: this.config.imap.tls,
-        tlsOptions: { rejectUnauthorized: false },
+        ...(this.allowSelfSigned ? { tlsOptions: { rejectUnauthorized: false } } : {}),
       });
 
       const emails: IncomingEmail[] = [];
@@ -204,7 +206,7 @@ export class EmailClient {
         host: this.config.imap.host,
         port: this.config.imap.port,
         tls: this.config.imap.tls,
-        tlsOptions: { rejectUnauthorized: false },
+        ...(this.allowSelfSigned ? { tlsOptions: { rejectUnauthorized: false } } : {}),
       });
 
       const emails: IncomingEmail[] = [];

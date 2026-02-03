@@ -19,6 +19,9 @@ export/
 
 # Workspace listings (contain correspondence)
 workspace/listings/
+workspace/claude/
+workspace/rankings/
+workspace/search.json
 
 # Playwright
 playwright-report/

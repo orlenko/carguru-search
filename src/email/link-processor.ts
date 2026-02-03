@@ -3,16 +3,15 @@
  * Extracts links from dealer emails and fetches additional info from linked pages
  */
 
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import { writeFileSync, unlinkSync, mkdirSync, existsSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
 import type { IncomingEmail } from './client.js';
 import type { Listing } from '../database/client.js';
 import { getDatabase } from '../database/index.js';
+import path from 'path';
+import fs from 'fs';
+import { runClaudeTask } from '../claude/task-runner.js';
+import { syncListingToWorkspace, writeSearchContext } from '../workspace/index.js';
 
-const execAsync = promisify(exec);
+const CLAUDE_SENTINEL = 'task complete';
 
 export interface ExtractedLink {
   url: string;
@@ -105,7 +104,6 @@ function classifyLink(url: string, text: string): ExtractedLink {
     lowerUrl.includes('/used-car/') ||
     lowerUrl.includes('autotrader') ||
     lowerUrl.includes('kijiji') ||
-    lowerUrl.includes('cargurus') ||
     /\/\d{5,}/.test(lowerUrl)  // URL with numeric ID
   ) {
     type = 'listing';
@@ -185,8 +183,11 @@ export function filterRelevantLinks(links: ExtractedLink[]): ExtractedLink[] {
 /**
  * Fetch and analyze content from a URL using Claude
  */
-export async function fetchAndAnalyzeLink(url: string): Promise<LinkContent | null> {
-  const prompt = `Analyze this car listing/dealer page and extract:
+export async function fetchAndAnalyzeLink(url: string, workspaceDir: string): Promise<LinkContent | null> {
+  const prompt = `Fetch and analyze this URL:
+${url}
+
+Analyze the car listing/dealer page content and extract:
 1. Vehicle details (year, make, model, trim, VIN if visible)
 2. Price (number only)
 3. Mileage/odometer (in km)
@@ -211,21 +212,40 @@ Respond with JSON only:
 If the page is not a car listing (e.g., generic homepage, error page), return:
 {"title": "page title", "description": "not a vehicle listing", "vin": null, "price": null, "mileage": null, "specs": {}, "photoUrls": [], "carfaxUrl": null, "rawText": ""}`;
 
-  const promptFile = join(tmpdir(), `link-analysis-${Date.now()}.txt`);
-  writeFileSync(promptFile, prompt);
-
   try {
-    // Use Claude with web fetch capability
-    const { stdout } = await execAsync(
-      `claude --print --model haiku "Fetch this URL and analyze: ${url}" < "${promptFile}"`,
-      { timeout: 60000, maxBuffer: 1024 * 1024 }
-    );
+    const taskDir = path.join(workspaceDir, 'claude', `link-analysis-${Date.now()}`);
+    fs.mkdirSync(taskDir, { recursive: true });
+    const taskFile = path.join(taskDir, 'task.md');
+    const resultFile = path.join(taskDir, 'result.json');
+    const resultRel = path.relative(workspaceDir, resultFile);
 
-    // Clean up prompt file
-    unlinkSync(promptFile);
+    const taskBody = `${prompt}
 
-    // Try to parse JSON from response
-    const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+---
+
+Write ONLY the JSON to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+    fs.writeFileSync(taskFile, taskBody);
+
+    await runClaudeTask({
+      workspaceDir,
+      taskFile: path.relative(workspaceDir, taskFile),
+      resultFile: resultRel,
+      model: process.env.CLAUDE_MODEL_LINK || process.env.CLAUDE_MODEL || undefined,
+      dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+      timeoutMs: 60000,
+      sentinel: CLAUDE_SENTINEL,
+    });
+
+    if (!fs.existsSync(resultFile)) {
+      throw new Error('Claude did not write a result file');
+    }
+
+    const raw = fs.readFileSync(resultFile, 'utf-8');
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
       return {
@@ -243,7 +263,6 @@ If the page is not a car listing (e.g., generic homepage, error page), return:
     }
   } catch (error) {
     console.error(`Failed to analyze link ${url}:`, error);
-    try { unlinkSync(promptFile); } catch {}
   }
 
   return null;
@@ -263,6 +282,8 @@ export async function processEmailLinks(
   additionalPhotos: string[];
 }> {
   const db = getDatabase();
+  writeSearchContext();
+  const listingDir = syncListingToWorkspace(listing);
 
   // Extract and filter links
   const allLinks = extractLinksFromEmail(email);
@@ -291,7 +312,7 @@ export async function processEmailLinks(
   for (const link of listingLinks.slice(0, 3)) { // Limit to 3 listing links
     console.log(`    🔗 Analyzing listing link: ${link.url.slice(0, 60)}...`);
 
-    const content = await fetchAndAnalyzeLink(link.url);
+    const content = await fetchAndAnalyzeLink(link.url, listingDir);
     if (content) {
       result.linksProcessed++;
 

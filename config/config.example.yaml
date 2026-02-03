@@ -14,12 +14,6 @@ search:
   postalCode: "M5V1J1"  # Your postal code
   radiusKm: 100         # Search radius
 
-  # Sites to search
-  sites:
-    - cargurus
-    - autotrader
-    # - kijiji  # Coming soon
-
 scoring:
   # Weights for ranking (0-1, should sum to 1)
   weights:
@@ -42,23 +36,6 @@ scoring:
     preferPrivateSeller: false
     preferCertified: false
     maxOwners: 3
-
-email:
-  # Your contact email for dealer communications
-  fromName: "Your Name"
-  fromEmail: "your-car-search@gmail.com"
-
-  # IMAP settings (Gmail example)
-  imap:
-    host: "imap.gmail.com"
-    port: 993
-    secure: true
-
-  # SMTP settings (Gmail example)
-  smtp:
-    host: "smtp.gmail.com"
-    port: 587
-    secure: false
 
 checkpoints:
   # Enable/disable human approval checkpoints globally

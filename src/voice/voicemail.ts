@@ -1,11 +1,14 @@
-import { writeFileSync, unlinkSync, createWriteStream } from 'fs';
+import * as fs from 'fs';
+import path from 'path';
 import { tmpdir } from 'os';
-import { join } from 'path';
 import { pipeline } from 'stream/promises';
 import { Readable } from 'stream';
 import OpenAI from 'openai';
 import { getEnv } from '../config.js';
-import { execAsync } from '../analyzers/listing-analyzer.js';
+import { runClaudeTask } from '../claude/task-runner.js';
+import { writeSearchContext } from '../workspace/index.js';
+
+const CLAUDE_SENTINEL = 'task complete';
 
 export interface TwilioRecording {
   sid: string;
@@ -109,7 +112,7 @@ export async function downloadRecording(recording: TwilioRecording): Promise<str
   const accountSid = getEnv('TWILIO_ACCOUNT_SID');
   const authToken = getEnv('TWILIO_AUTH_TOKEN');
 
-  const outputPath = join(tmpdir(), `voicemail-${recording.sid}.mp3`);
+  const outputPath = path.join(tmpdir(), `voicemail-${recording.sid}.mp3`);
 
   const response = await fetch(recording.url, {
     headers: {
@@ -121,7 +124,7 @@ export async function downloadRecording(recording: TwilioRecording): Promise<str
     throw new Error(`Failed to download recording: ${response.statusText}`);
   }
 
-  const fileStream = createWriteStream(outputPath);
+  const fileStream = fs.createWriteStream(outputPath);
   await pipeline(Readable.fromWeb(response.body as any), fileStream);
 
   return outputPath;
@@ -177,16 +180,42 @@ Respond with a JSON object:
 
 Respond ONLY with the JSON object.`;
 
-  const promptFile = join(tmpdir(), `voicemail-parse-${Date.now()}.txt`);
-  writeFileSync(promptFile, prompt);
-
   try {
-    const { stdout } = await execAsync(
-      `cat "${promptFile}" | claude --print --model haiku`,
-      { timeout: 60000, maxBuffer: 1024 * 1024 }
-    );
+    writeSearchContext();
+    const workspaceDir = path.resolve('workspace');
+    const taskDir = path.join(workspaceDir, 'claude', `voicemail-parse-${Date.now()}`);
+    fs.mkdirSync(taskDir, { recursive: true });
+    const taskFile = path.join(taskDir, 'task.md');
+    const resultFile = path.join(taskDir, 'result.json');
+    const resultRel = path.relative(workspaceDir, resultFile);
 
-    const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+    const taskBody = `${prompt}
+
+---
+
+Write ONLY the JSON to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+    fs.writeFileSync(taskFile, taskBody);
+
+    await runClaudeTask({
+      workspaceDir,
+      taskFile: path.relative(workspaceDir, taskFile),
+      resultFile: resultRel,
+      model: process.env.CLAUDE_MODEL_VOICEMAIL || process.env.CLAUDE_MODEL || undefined,
+      dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+      timeoutMs: 60000,
+      sentinel: CLAUDE_SENTINEL,
+    });
+
+    if (!fs.existsSync(resultFile)) {
+      throw new Error('Claude did not write a result file');
+    }
+
+    const raw = fs.readFileSync(resultFile, 'utf-8');
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       throw new Error('No JSON in response');
     }
@@ -204,10 +233,6 @@ Respond ONLY with the JSON object.`;
       actionRequired: true,
       suggestedAction: 'Listen to voicemail and respond',
     };
-  } finally {
-    try {
-      unlinkSync(promptFile);
-    } catch {}
   }
 }
 

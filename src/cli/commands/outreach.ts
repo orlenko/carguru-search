@@ -10,6 +10,7 @@ import { shouldSkipEmail } from '../../email/filters.js';
 import { analyzeCarfaxBuffer } from '../../analyzers/carfax-analyzer.js';
 import type { ListingAnalysis } from '../../analyzers/listing-analyzer.js';
 import type { Listing } from '../../database/client.js';
+import { matchListingFromEmail } from '../../email/matching.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -48,6 +49,7 @@ export const outreachCommand = new Command('outreach')
       const candidates = ranked.filter(({ listing, score }) => {
         // Must pass scoring
         if (!score.passed || score.totalScore < minScore) return false;
+        if (listing.status !== 'analyzed') return false;
 
         // Must not have been contacted already
         if (listing.status === 'contacted' || listing.contactAttempts > 0) return false;
@@ -119,12 +121,19 @@ export const outreachCommand = new Command('outreach')
 
             // Update listing status
             db.updateListing(listing.id, {
-              status: 'contacted',
               lastContactedAt: new Date().toISOString(),
               contactAttempts: (listing.contactAttempts || 0) + 1,
               sellerEmail: result.dealerEmail,
               sellerPhone: result.dealerPhone,
+              infoStatus: 'carfax_requested',
             });
+            const transitionResult = db.transitionStatePath(listing.id, 'awaiting_response', {
+              triggeredBy: 'system',
+              reasoning: 'Initial outreach sent',
+            });
+            if (!transitionResult.success) {
+              console.log(`⚠️ State transition failed: ${transitionResult.error}`);
+            }
 
             contacted++;
           } else {
@@ -182,7 +191,10 @@ export const inboxCommand = new Command('inbox')
       console.log('\n📬 Inbox Status\n');
 
       // Get contacted listings
-      const contacted = db.listListings({ status: 'contacted', limit: 100 });
+      const contacted = db.listListings({
+        status: ['contacted', 'awaiting_response', 'negotiating'] as any,
+        limit: 100,
+      });
 
       if (contacted.length === 0) {
         console.log('No active conversations.');
@@ -253,6 +265,7 @@ export const autoRespondCommand = new Command('auto-respond')
 
       // Get new emails
       const emails = await emailClient.fetchNewEmails();
+      const processedEmailIds = db.getProcessedEmailIds();
 
       if (emails.length === 0) {
         console.log('No new emails to process.');
@@ -263,33 +276,41 @@ export const autoRespondCommand = new Command('auto-respond')
       console.log(`Found ${emails.length} new email(s)\n`);
 
       // Get contacted listings for matching
-      const contactedListings = db.listListings({ status: 'contacted', limit: 100 });
+      const contactedListings = db.listListings({
+        status: ['contacted', 'awaiting_response', 'negotiating'] as any,
+        limit: 100,
+      });
 
       for (const email of emails) {
         console.log('─'.repeat(60));
         console.log(`From: ${email.from}`);
         console.log(`Subject: ${email.subject}`);
 
+        if (email.messageId && processedEmailIds.has(email.messageId)) {
+          console.log('⏭️  Already processed - skipping');
+          continue;
+        }
+
         // Check if we should skip this email (noreply, automated, marketing)
         const skipCheck = shouldSkipEmail(email);
         if (skipCheck.skip) {
           console.log(`⏭️  Skipping: ${skipCheck.reason}`);
+          if (!options.dryRun && email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: `skipped: ${skipCheck.reason}`,
+            });
+            processedEmailIds.add(email.messageId);
+          }
           continue;
         }
 
         console.log(`Preview: ${email.text.slice(0, 100)}...`);
 
         // Try to match email to a listing
-        const matchedListing = contactedListings.find(listing => {
-          // Match by seller email
-          if (listing.sellerEmail && email.from.includes(listing.sellerEmail)) return true;
-          // Match by dealer name in email
-          if (listing.sellerName && email.from.toLowerCase().includes(listing.sellerName.toLowerCase())) return true;
-          // Match by vehicle mention in subject/body
-          const vehicle = `${listing.make} ${listing.model}`.toLowerCase();
-          if (email.subject.toLowerCase().includes(vehicle)) return true;
-          return false;
-        });
+        const matchedListing = matchListingFromEmail(email, contactedListings);
 
         if (matchedListing) {
           console.log(`\n✅ Matched to: #${matchedListing.id} ${matchedListing.year} ${matchedListing.make} ${matchedListing.model}`);
@@ -337,6 +358,7 @@ export const autoRespondCommand = new Command('auto-respond')
                 db.updateListing(matchedListing.id, {
                   carfaxReceived: true,
                   carfaxPath,
+                  infoStatus: 'carfax_received',
                   accidentCount: analysis.data.accidentCount,
                   ownerCount: analysis.data.ownerCount,
                   serviceRecordCount: analysis.data.serviceRecordCount,
@@ -359,6 +381,7 @@ export const autoRespondCommand = new Command('auto-respond')
                 db.updateListing(matchedListing.id, {
                   carfaxReceived: true,
                   carfaxPath,
+                  infoStatus: 'carfax_received',
                 });
               }
             }
@@ -383,11 +406,42 @@ export const autoRespondCommand = new Command('auto-respond')
                 subject: `Re: ${email.subject}`,
                 text,
               });
+              db.updateListing(matchedListing.id, { infoStatus: 'carfax_requested' });
               console.log(`✅ CARFAX request sent to ${replyTo}`);
             }
           }
+
+          if (!options.dryRun) {
+            const transitionResult = db.transitionStatePath(matchedListing.id, 'negotiating', {
+              triggeredBy: 'system',
+              reasoning: 'Received seller response',
+            });
+            if (!transitionResult.success) {
+              console.log(`⚠️ State transition failed: ${transitionResult.error}`);
+            }
+          }
+
+          if (!options.dryRun && email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              listingId: matchedListing.id,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: 'auto_respond_processed',
+            });
+            processedEmailIds.add(email.messageId);
+          }
         } else {
           console.log('\n❓ Could not match to any listing');
+          if (!options.dryRun && email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: 'unmatched',
+            });
+            processedEmailIds.add(email.messageId);
+          }
         }
       }
 

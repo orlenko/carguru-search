@@ -92,6 +92,7 @@ export const respondCommand = new Command('respond')
           // Update listing
           db.updateListing(listing.id, {
             lastContactedAt: new Date().toISOString(),
+            lastOurResponseAt: new Date().toISOString(),
             contactAttempts: (listing.contactAttempts || 0) + 1,
           });
 
@@ -168,12 +169,24 @@ export const draftCommand = new Command('draft')
 
           console.log(`\n✅ Email sent! (ID: ${messageId})`);
 
+          const infoStatus = template === 'carfax_request' || template === 'initial_inquiry'
+            ? 'carfax_requested'
+            : undefined;
           db.updateListing(listing.id, {
-            status: 'contacted',
             lastContactedAt: new Date().toISOString(),
             contactAttempts: (listing.contactAttempts || 0) + 1,
             sellerEmail: email,
+            ...(infoStatus ? { infoStatus } : {}),
           });
+          if (listing.status === 'analyzed' || listing.status === 'contacted' || listing.status === 'awaiting_response') {
+            const transitionResult = db.transitionStatePath(listing.id, 'awaiting_response', {
+              triggeredBy: 'user',
+              reasoning: `Manual email sent (${template})`,
+            });
+            if (!transitionResult.success) {
+              console.log(`⚠️ State transition failed: ${transitionResult.error}`);
+            }
+          }
 
           emailClient.close();
         } else {

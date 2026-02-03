@@ -1,161 +1,16 @@
 import { Command } from 'commander';
 import { getDatabase } from '../../database/index.js';
-import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { runClaudeTask } from '../../claude/task-runner.js';
+import {
+  syncListingToWorkspace,
+  writeSearchContext,
+  WORKSPACE_DIR,
+  getListingWorkspaceDir,
+} from '../../workspace/index.js';
 
-const WORKSPACE_DIR = 'workspace';
-const LISTINGS_DIR = path.join(WORKSPACE_DIR, 'listings');
-
-/**
- * Get the workspace directory name for a listing
- */
-function getListingDirName(listing: { id: number; year: number; make: string; model: string }): string {
-  const slug = `${listing.year}-${listing.make}-${listing.model}`
-    .toLowerCase()
-    .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9-]/g, '');
-  return `${String(listing.id).padStart(3, '0')}-${slug}`;
-}
-
-/**
- * Sync a listing to the workspace
- */
-function syncListingToWorkspace(listingId: number): string | null {
-  const db = getDatabase();
-  const listing = db.getListing(listingId);
-
-  if (!listing) {
-    console.error(`Listing #${listingId} not found`);
-    return null;
-  }
-
-  const dirName = getListingDirName(listing);
-  const listingDir = path.join(LISTINGS_DIR, dirName);
-  const emailsDir = path.join(listingDir, 'emails');
-  const attachmentsDir = path.join(listingDir, 'attachments');
-
-  // Create directories
-  fs.mkdirSync(emailsDir, { recursive: true });
-  fs.mkdirSync(attachmentsDir, { recursive: true });
-
-  // Write listing.md
-  const listingMd = `# ${listing.year} ${listing.make} ${listing.model}
-
-## Quick Facts
-
-| Field | Value |
-|-------|-------|
-| **Price** | $${listing.price?.toLocaleString() || 'N/A'} |
-| **Mileage** | ${listing.mileageKm?.toLocaleString() || 'N/A'} km |
-| **Location** | ${listing.city || ''}${listing.city && listing.province ? ', ' : ''}${listing.province || 'N/A'} |
-| **Seller** | ${listing.sellerName || 'Unknown'} |
-| **Seller Type** | ${listing.sellerType || 'Unknown'} |
-| **VIN** | ${listing.vin || 'N/A'} |
-| **Status** | ${listing.status} |
-
-## Seller Contact
-
-- **Phone:** ${listing.sellerPhone || 'N/A'}
-- **Email:** ${listing.sellerEmail || 'N/A'}
-
-## Listing URL
-
-${listing.sourceUrl}
-
-## Description
-
-${listing.description || 'No description available.'}
-
-## Notes
-
-${listing.notes || 'None'}
-`;
-
-  fs.writeFileSync(path.join(listingDir, 'listing.md'), listingMd);
-
-  // Write analysis.md if we have AI analysis
-  if (listing.aiAnalysis) {
-    try {
-      const analysis = JSON.parse(listing.aiAnalysis);
-      const analysisMd = `# AI Analysis
-
-## Summary
-
-${analysis.summary || 'No summary available.'}
-
-## Score
-
-**Overall Score:** ${analysis.score || 'N/A'}/100
-
-## Red Flags
-
-${analysis.redFlags?.map((f: string) => `- ${f}`).join('\n') || 'None identified'}
-
-## Positive Factors
-
-${analysis.positives?.map((p: string) => `- ${p}`).join('\n') || 'None identified'}
-
-## Pricing Assessment
-
-${analysis.pricing?.assessment || 'No pricing assessment available.'}
-
-## Recommendation
-
-${analysis.recommendation || 'No recommendation available.'}
-`;
-      fs.writeFileSync(path.join(listingDir, 'analysis.md'), analysisMd);
-    } catch {
-      // Invalid JSON, skip analysis
-    }
-  }
-
-  // Copy CARFAX if exists
-  if (listing.carfaxPath && fs.existsSync(listing.carfaxPath)) {
-    fs.copyFileSync(listing.carfaxPath, path.join(listingDir, 'carfax.pdf'));
-  }
-
-  // Write CARFAX summary if available
-  if (listing.carfaxSummary) {
-    const carfaxMd = `# CARFAX Summary
-
-${listing.carfaxSummary}
-
-## Key Data
-
-- **Accidents:** ${listing.accidentCount ?? 'Unknown'}
-- **Owners:** ${listing.ownerCount ?? 'Unknown'}
-- **Service Records:** ${listing.serviceRecordCount ?? 'Unknown'}
-`;
-    fs.writeFileSync(path.join(listingDir, 'carfax-summary.md'), carfaxMd);
-  }
-
-  // Write conversation history if exists
-  if (listing.sellerConversation && listing.sellerConversation.length > 0) {
-    let emailNum = 1;
-
-    for (const msg of listing.sellerConversation) {
-      const direction = msg.direction || 'inbound';
-      const date = msg.date || new Date().toISOString();
-      const dateStr = date.split('T')[0];
-      const filename = `${String(emailNum).padStart(2, '0')}-${direction}-${dateStr}.md`;
-
-      const emailMd = `# ${direction === 'outbound' ? 'Sent' : 'Received'}: ${date}
-
-**Channel:** ${msg.channel}
-**Subject:** ${msg.subject || 'N/A'}
-
----
-
-${msg.body || 'No content'}
-`;
-      fs.writeFileSync(path.join(emailsDir, filename), emailMd);
-      emailNum++;
-    }
-  }
-
-  return listingDir;
-}
+const CLAUDE_SENTINEL = 'task complete';
 
 export const syncWorkspaceCommand = new Command('sync-workspace')
   .description('Sync contacted listings to workspace for Claude analysis')
@@ -165,18 +20,24 @@ export const syncWorkspaceCommand = new Command('sync-workspace')
     try {
       const db = getDatabase();
 
-      // Ensure workspace exists
-      fs.mkdirSync(LISTINGS_DIR, { recursive: true });
+      // Ensure workspace exists + search context
+      writeSearchContext();
 
       let listings: { id: number }[] = [];
 
       if (options.id) {
         listings = [{ id: parseInt(options.id) }];
       } else if (options.all) {
-        listings = db.listListings({ status: 'contacted', limit: 100 });
+        listings = db.listListings({
+          status: ['contacted', 'awaiting_response', 'negotiating'] as any,
+          limit: 100,
+        });
       } else {
         // Default: sync contacted listings
-        listings = db.listListings({ status: 'contacted', limit: 100 });
+        listings = db.listListings({
+          status: ['contacted', 'awaiting_response', 'negotiating'] as any,
+          limit: 100,
+        });
       }
 
       if (listings.length === 0) {
@@ -190,10 +51,8 @@ export const syncWorkspaceCommand = new Command('sync-workspace')
         const listing = db.getListing(id);
         if (!listing) continue;
 
-        const dir = syncListingToWorkspace(id);
-        if (dir) {
-          console.log(`✅ #${id}: ${listing.year} ${listing.make} ${listing.model} → ${dir}`);
-        }
+        const dir = syncListingToWorkspace(listing);
+        console.log(`✅ #${id}: ${listing.year} ${listing.make} ${listing.model} → ${dir}`);
       }
 
       console.log(`\nWorkspace synced: ${WORKSPACE_DIR}/`);
@@ -222,8 +81,8 @@ export const addEmailCommand = new Command('add-email')
         process.exit(1);
       }
 
-      const dirName = getListingDirName(listing);
-      const emailsDir = path.join(LISTINGS_DIR, dirName, 'emails');
+      const listingDir = getListingWorkspaceDir(listing);
+      const emailsDir = path.join(listingDir, 'emails');
 
       if (!fs.existsSync(emailsDir)) {
         console.error(`Listing not synced to workspace. Run: carsearch sync-workspace --id ${id}`);
@@ -278,13 +137,13 @@ export const askClaudeCommand = new Command('ask-claude')
         process.exit(1);
       }
 
-      const dirName = getListingDirName(listing);
-      const listingDir = path.join(LISTINGS_DIR, dirName);
+      writeSearchContext();
+      const listingDir = getListingWorkspaceDir(listing);
 
       // Sync listing if not already in workspace
       if (!fs.existsSync(listingDir)) {
         console.log('Syncing listing to workspace...');
-        syncListingToWorkspace(parseInt(id));
+        syncListingToWorkspace(listing);
       }
 
       // Get email text
@@ -347,23 +206,40 @@ Please analyze this email following the instructions in CLAUDE.md:
       console.log('Invoking Claude to analyze dealer response...');
       console.log('═'.repeat(60) + '\n');
 
-      // Invoke Claude CLI
-      const claude = spawn('claude', ['-p', prompt], {
-        cwd: WORKSPACE_DIR,
-        stdio: 'inherit',
+      const taskDir = path.join(listingDir, 'claude', `ask-claude-${Date.now()}`);
+      fs.mkdirSync(taskDir, { recursive: true });
+      const taskFile = path.join(taskDir, 'task.md');
+      const resultFile = path.join(taskDir, 'result.md');
+      const resultRel = path.relative(listingDir, resultFile);
+
+      const taskBody = `${prompt}
+
+---
+
+Write your response in markdown to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+      fs.writeFileSync(taskFile, taskBody);
+
+      await runClaudeTask({
+        workspaceDir: listingDir,
+        taskFile: path.relative(listingDir, taskFile),
+        resultFile: resultRel,
+        model: process.env.CLAUDE_MODEL || undefined,
+        dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+        timeoutMs: 120000,
+        sentinel: CLAUDE_SENTINEL,
       });
 
-      claude.on('error', (err) => {
-        console.error('Failed to invoke Claude:', err);
-        console.log('\nMake sure Claude CLI is installed: npm install -g @anthropic-ai/claude-code');
+      if (!fs.existsSync(resultFile)) {
+        console.error('Claude did not write a result file.');
         process.exit(1);
-      });
+      }
 
-      claude.on('exit', (code) => {
-        if (code !== 0) {
-          console.error(`\nClaude exited with code ${code}`);
-        }
-      });
+      const output = fs.readFileSync(resultFile, 'utf-8');
+      console.log(output.trim());
 
     } catch (error) {
       console.error('Failed:', error);
@@ -422,63 +298,69 @@ Respond with this exact JSON structure:
   "draft_response": "The suggested response text, or null if no response needed"
 }`;
 
-      const claude = spawn('claude', ['-p', prompt, '--output-format', 'text'], {
-        cwd: process.cwd(),
-        stdio: ['pipe', 'pipe', 'pipe'],
+      writeSearchContext();
+      const listingDir = syncListingToWorkspace(listing);
+      const taskDir = path.join(listingDir, 'claude', `analyze-email-${Date.now()}`);
+      fs.mkdirSync(taskDir, { recursive: true });
+      const taskFile = path.join(taskDir, 'task.md');
+      const resultFile = path.join(taskDir, 'result.json');
+      const resultRel = path.relative(listingDir, resultFile);
+
+      const taskBody = `${prompt}
+
+---
+
+Write ONLY the JSON to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+      fs.writeFileSync(taskFile, taskBody);
+
+      await runClaudeTask({
+        workspaceDir: listingDir,
+        taskFile: path.relative(listingDir, taskFile),
+        resultFile: resultRel,
+        model: process.env.CLAUDE_MODEL || undefined,
+        dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+        timeoutMs: 120000,
+        sentinel: CLAUDE_SENTINEL,
       });
 
-      let output = '';
-      let errorOutput = '';
+      if (!fs.existsSync(resultFile)) {
+        console.error('Claude did not write a result file.');
+        process.exit(1);
+      }
 
-      claude.stdout?.on('data', (data) => {
-        output += data.toString();
-      });
+      const output = fs.readFileSync(resultFile, 'utf-8');
+      const jsonMatch = output.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.log('Raw output:', output);
+        return;
+      }
 
-      claude.stderr?.on('data', (data) => {
-        errorOutput += data.toString();
-      });
+      const result = JSON.parse(jsonMatch[0]);
 
-      claude.on('exit', (code) => {
-        if (code !== 0) {
-          console.error('Claude analysis failed:', errorOutput);
-          process.exit(1);
-        }
+      console.log('\n📧 Email Analysis\n');
+      console.log(`Classification: ${result.classification}`);
+      console.log(`Summary: ${result.summary}`);
+      console.log(`Action: ${result.action}`);
+      console.log(`Urgency: ${result.urgency}`);
 
-        // Try to parse JSON from output
-        try {
-          // Find JSON in output (may have other text around it)
-          const jsonMatch = output.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const result = JSON.parse(jsonMatch[0]);
+      if (result.key_points?.length > 0) {
+        console.log('\nKey Points:');
+        result.key_points.forEach((p: string) => console.log(`  - ${p}`));
+      }
 
-            console.log('\n📧 Email Analysis\n');
-            console.log(`Classification: ${result.classification}`);
-            console.log(`Summary: ${result.summary}`);
-            console.log(`Action: ${result.action}`);
-            console.log(`Urgency: ${result.urgency}`);
+      if (result.price_mentioned) {
+        console.log(`\nPrice Mentioned: $${result.price_mentioned.toLocaleString()}`);
+      }
 
-            if (result.key_points?.length > 0) {
-              console.log('\nKey Points:');
-              result.key_points.forEach((p: string) => console.log(`  - ${p}`));
-            }
-
-            if (result.price_mentioned) {
-              console.log(`\nPrice Mentioned: $${result.price_mentioned.toLocaleString()}`);
-            }
-
-            if (result.draft_response) {
-              console.log('\n--- Suggested Response ---\n');
-              console.log(result.draft_response);
-              console.log('\n--------------------------');
-            }
-          } else {
-            console.log('Raw output:', output);
-          }
-        } catch (e) {
-          console.log('Could not parse JSON response. Raw output:');
-          console.log(output);
-        }
-      });
+      if (result.draft_response) {
+        console.log('\n--- Suggested Response ---\n');
+        console.log(result.draft_response);
+        console.log('\n--------------------------');
+      }
 
     } catch (error) {
       console.error('Failed:', error);

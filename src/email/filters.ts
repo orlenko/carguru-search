@@ -13,6 +13,21 @@ export interface SkipResult {
   reason: string;
 }
 
+function isAutoTraderLead(email: EmailFilterInput): boolean {
+  const fromLower = email.from.toLowerCase();
+  const subjectLower = email.subject.toLowerCase();
+  const textLower = email.text.toLowerCase();
+
+  const fromTrader = fromLower.includes('@trader.ca') || fromLower.includes('@autotrader.ca');
+  const subjectLead = subjectLower.includes('lead') ||
+    subjectLower.includes('autotrader') ||
+    subjectLower.includes('used trader lead') ||
+    subjectLower.includes('sales lead');
+  const textLead = textLower.includes('autotrader') && textLower.includes('lead');
+
+  return (fromTrader && subjectLead) || subjectLead || textLead;
+}
+
 /**
  * Check if an email should be skipped (automated, noreply, marketing, etc.)
  * Used by: smart-respond, pipeline, outreach, negotiate, email-followup
@@ -20,6 +35,10 @@ export interface SkipResult {
 export function shouldSkipEmail(email: EmailFilterInput): SkipResult {
   const fromLower = email.from.toLowerCase();
   const subjectLower = email.subject.toLowerCase();
+
+  if (isAutoTraderLead(email)) {
+    return { skip: false, reason: '' };
+  }
 
   // Skip noreply addresses
   if (fromLower.includes('noreply') || fromLower.includes('no-reply') || fromLower.includes('donotreply')) {

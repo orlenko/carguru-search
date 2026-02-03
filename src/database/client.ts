@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { SCHEMA, MIGRATIONS, type ListingStatus, type InfoStatus, type ListingState, isValidTransition, getStateDescription } from './schema.js';
+import { SCHEMA, MIGRATIONS, type ListingStatus, type InfoStatus, type ListingState, isValidTransition, getStateDescription, STATE_TRANSITIONS } from './schema.js';
 import path from 'path';
 
 export interface ConversationMessage {
@@ -589,6 +589,77 @@ export class DatabaseClient {
     });
 
     return { success: true };
+  }
+
+  /**
+   * Transition a listing to a target state, following a valid path if needed
+   */
+  transitionStatePath(
+    listingId: number,
+    targetState: ListingState,
+    options: {
+      triggeredBy?: 'system' | 'user' | 'claude';
+      reasoning?: string;
+      context?: Record<string, unknown>;
+    } = {}
+  ): { success: boolean; error?: string; path?: ListingState[] } {
+    const listing = this.getListing(listingId);
+    if (!listing) {
+      return { success: false, error: 'Listing not found' };
+    }
+
+    const currentState = listing.status as ListingState;
+    if (currentState === targetState) {
+      return { success: true, path: [currentState] };
+    }
+
+    const visited = new Set<ListingState>();
+    const queue: ListingState[] = [];
+    const prev = new Map<ListingState, ListingState | null>();
+
+    visited.add(currentState);
+    queue.push(currentState);
+    prev.set(currentState, null);
+
+    while (queue.length > 0) {
+      const state = queue.shift() as ListingState;
+      const nextStates = STATE_TRANSITIONS[state] || [];
+      for (const next of nextStates) {
+        if (visited.has(next)) continue;
+        visited.add(next);
+        prev.set(next, state);
+        if (next === targetState) {
+          queue.length = 0;
+          break;
+        }
+        queue.push(next);
+      }
+    }
+
+    if (!visited.has(targetState)) {
+      return {
+        success: false,
+        error: `No valid transition path from '${currentState}' to '${targetState}'`,
+      };
+    }
+
+    const path: ListingState[] = [];
+    let cursor: ListingState | null = targetState;
+    while (cursor && cursor !== currentState) {
+      path.push(cursor);
+      cursor = prev.get(cursor) || null;
+    }
+    path.reverse();
+
+    const fullPath = [currentState, ...path];
+    for (const nextState of path) {
+      const result = this.transitionState(listingId, nextState, options);
+      if (!result.success) {
+        return result;
+      }
+    }
+
+    return { success: true, path: fullPath };
   }
 
   /**

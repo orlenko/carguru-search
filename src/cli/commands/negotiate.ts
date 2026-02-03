@@ -11,6 +11,8 @@ import {
 } from '../../negotiation/negotiator.js';
 import { EmailClient } from '../../email/client.js';
 import { shouldSkipEmail } from '../../email/filters.js';
+import { checkOfferApproval } from '../../checkpoints/index.js';
+import { matchListingFromEmail } from '../../email/matching.js';
 
 // Safety limits for auto-send mode
 const AUTO_SEND_DEFAULTS = {
@@ -236,6 +238,20 @@ export const negotiateCommand = new Command('negotiate')
           process.exit(1);
         }
 
+        if (options.autoSend && response.suggestedOffer) {
+          const approval = checkOfferApproval(listing.id, response.suggestedOffer, {
+            to: email,
+            subject: `Re: ${vehicle}`,
+            message: response.message,
+            suggestedOffer: response.suggestedOffer,
+          });
+          if (approval.requiresApproval) {
+            console.log(`\n🛑 AUTO-SEND BLOCKED: ${approval.reason}`);
+            console.log(`   Approval queued (ID: ${approval.approvalId})`);
+            return;
+          }
+        }
+
         const emailClient = new EmailClient();
         const messageId = await emailClient.send({
           to: email,
@@ -249,8 +265,16 @@ export const negotiateCommand = new Command('negotiate')
         }
         db.updateListing(listing.id, {
           lastContactedAt: new Date().toISOString(),
+          lastOurResponseAt: new Date().toISOString(),
           contactAttempts: (listing.contactAttempts || 0) + 1,
         });
+        const transitionResult = db.transitionStatePath(listing.id, 'negotiating', {
+          triggeredBy: options.autoSend ? 'system' : 'user',
+          reasoning: 'Negotiation message sent',
+        });
+        if (!transitionResult.success) {
+          console.log(`⚠️ State transition failed: ${transitionResult.error}`);
+        }
         emailClient.close();
       } else if (!options.autoSend) {
         console.log('\nTo send this message, run again with --send flag.');
@@ -278,6 +302,7 @@ export const autoNegotiateCommand = new Command('auto-negotiate')
 
       const emailClient = new EmailClient();
       const emails = await emailClient.fetchNewEmails();
+      const processedEmailIds = db.getProcessedEmailIds();
 
       if (emails.length === 0) {
         console.log('No new emails to process.');
@@ -300,24 +325,41 @@ export const autoNegotiateCommand = new Command('auto-negotiate')
         console.log(`From: ${email.from}`);
         console.log(`Subject: ${email.subject}`);
 
+        if (email.messageId && processedEmailIds.has(email.messageId)) {
+          console.log(`  ⏭️  Already processed - skipping`);
+          continue;
+        }
+
         // Skip noreply/automated/marketing emails
         const skipCheck = shouldSkipEmail(email);
         if (skipCheck.skip) {
           console.log(`  ⏭️  Skipping: ${skipCheck.reason}`);
+          if (!options.dryRun && email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: `skipped: ${skipCheck.reason}`,
+            });
+            processedEmailIds.add(email.messageId);
+          }
           continue;
         }
 
         // Match to listing
-        const matchedListing = listings.find(listing => {
-          if (listing.sellerEmail && email.from.includes(listing.sellerEmail)) return true;
-          if (listing.sellerName && email.from.toLowerCase().includes(listing.sellerName.toLowerCase())) return true;
-          const vehicle = `${listing.make} ${listing.model}`.toLowerCase();
-          if (email.subject.toLowerCase().includes(vehicle)) return true;
-          return false;
-        });
+        const matchedListing = matchListingFromEmail(email, listings);
 
         if (!matchedListing) {
           console.log('  ❓ No matching listing found');
+          if (!options.dryRun && email.messageId) {
+            db.markEmailProcessed({
+              messageId: email.messageId,
+              fromAddress: email.from,
+              subject: email.subject,
+              action: 'unmatched',
+            });
+            processedEmailIds.add(email.messageId);
+          }
           continue;
         }
 
@@ -421,6 +463,22 @@ export const autoNegotiateCommand = new Command('auto-negotiate')
           blockReason = 'Deal near completion - human confirmation needed';
         }
 
+        const emailMatch = email.from.match(/<(.+)>/) || [null, email.from];
+        const replyTo = emailMatch[1];
+
+        if (!shouldBlock && response.suggestedOffer) {
+          const approval = checkOfferApproval(matchedListing.id, response.suggestedOffer, {
+            to: replyTo,
+            subject: `Re: ${email.subject}`,
+            message: response.message,
+            suggestedOffer: response.suggestedOffer,
+          });
+          if (approval.requiresApproval) {
+            shouldBlock = true;
+            blockReason = approval.reason || 'Offer requires approval';
+          }
+        }
+
         if (shouldBlock) {
           console.log(`  🛑 Blocked: ${blockReason}`);
           blocked++;
@@ -433,9 +491,6 @@ export const autoNegotiateCommand = new Command('auto-negotiate')
           });
         } else if (!options.dryRun) {
           // Send the response
-          const emailMatch = email.from.match(/<(.+)>/) || [null, email.from];
-          const replyTo = emailMatch[1];
-
           await emailClient.send({
             to: replyTo,
             subject: `Re: ${email.subject}`,
@@ -457,8 +512,16 @@ export const autoNegotiateCommand = new Command('auto-negotiate')
 
           db.updateListing(matchedListing.id, {
             lastContactedAt: new Date().toISOString(),
+            lastOurResponseAt: new Date().toISOString(),
             contactAttempts: (matchedListing.contactAttempts || 0) + 1,
           });
+          const transitionResult = db.transitionStatePath(matchedListing.id, 'negotiating', {
+            triggeredBy: 'system',
+            reasoning: 'Negotiation response sent',
+          });
+          if (!transitionResult.success) {
+            console.log(`  ⚠️ State transition failed: ${transitionResult.error}`);
+          }
         } else {
           console.log('  [DRY RUN] Would send response');
           context.conversationHistory.push({
@@ -478,6 +541,17 @@ export const autoNegotiateCommand = new Command('auto-negotiate')
             dealerConcessions: context.dealerConcessions,
           }, null, 2),
         });
+
+        if (!options.dryRun && email.messageId) {
+          db.markEmailProcessed({
+            messageId: email.messageId,
+            listingId: matchedListing.id,
+            fromAddress: email.from,
+            subject: email.subject,
+            action: shouldBlock ? 'blocked' : 'responded',
+          });
+          processedEmailIds.add(email.messageId);
+        }
       }
 
       emailClient.close();
@@ -511,7 +585,10 @@ export const negotiationStatusCommand = new Command('negotiation-status')
       const budget = config.search.priceMax || 18000;
 
       // Get contacted listings
-      const contacted = db.listListings({ status: 'contacted', limit: 100 });
+      const contacted = db.listListings({
+        status: ['contacted', 'awaiting_response', 'negotiating'] as any,
+        limit: 100,
+      });
 
       console.log('\n💰 Active Negotiations\n');
 

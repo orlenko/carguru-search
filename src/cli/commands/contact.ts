@@ -55,11 +55,23 @@ export const contactCommand = new Command('contact')
           const sid = await smsClient.send({ to: phone, body: message });
 
           // Update listing
+          const infoStatus = smsType === 'carfax_request' || smsType === 'inquiry'
+            ? 'carfax_requested'
+            : undefined;
           db.updateListing(listing.id, {
-            status: 'contacted',
             lastContactedAt: new Date().toISOString(),
             contactAttempts: (listing.contactAttempts || 0) + 1,
+            ...(infoStatus ? { infoStatus } : {}),
           });
+          if (listing.status === 'analyzed' || listing.status === 'contacted' || listing.status === 'awaiting_response') {
+            const transitionResult = db.transitionStatePath(listing.id, 'awaiting_response', {
+              triggeredBy: 'user',
+              reasoning: 'Manual SMS outreach sent',
+            });
+            if (!transitionResult.success) {
+              console.log(`⚠️ State transition failed: ${transitionResult.error}`);
+            }
+          }
 
           console.log(`✅ SMS sent! (SID: ${sid})`);
         } catch (error) {
@@ -99,12 +111,24 @@ export const contactCommand = new Command('contact')
           const messageId = await emailClient.send({ to: email, subject, text });
 
           // Update listing
+          const infoStatus = template === 'carfax_request' || template === 'initial_inquiry'
+            ? 'carfax_requested'
+            : undefined;
           db.updateListing(listing.id, {
-            status: 'contacted',
             lastContactedAt: new Date().toISOString(),
             contactAttempts: (listing.contactAttempts || 0) + 1,
             sellerEmail: email, // Save for future reference
+            ...(infoStatus ? { infoStatus } : {}),
           });
+          if (listing.status === 'analyzed' || listing.status === 'contacted' || listing.status === 'awaiting_response') {
+            const transitionResult = db.transitionStatePath(listing.id, 'awaiting_response', {
+              triggeredBy: 'user',
+              reasoning: 'Manual email outreach sent',
+            });
+            if (!transitionResult.success) {
+              console.log(`⚠️ State transition failed: ${transitionResult.error}`);
+            }
+          }
 
           console.log(`✅ Email sent! (ID: ${messageId})`);
           emailClient.close();

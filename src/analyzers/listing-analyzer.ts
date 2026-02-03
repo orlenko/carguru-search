@@ -1,11 +1,10 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import { writeFileSync, unlinkSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+import fs from 'fs';
+import path from 'path';
 import type { Listing } from '../database/client.js';
+import { runClaudeTask } from '../claude/task-runner.js';
+import { syncListingToWorkspace, writeSearchContext } from '../workspace/index.js';
 
-export const execAsync = promisify(exec);
+const CLAUDE_SENTINEL = 'task complete';
 
 export interface ListingAnalysis {
   redFlags: string[];
@@ -90,66 +89,73 @@ export async function analyzeListingWithClaude(listing: Listing): Promise<Listin
   const listingInfo = formatListingForAnalysis(listing);
   const prompt = ANALYSIS_PROMPT + listingInfo;
 
-  // Write prompt to temp file to avoid shell escaping issues
-  const promptFile = join(tmpdir(), `claude-prompt-${Date.now()}-${listing.id}.txt`);
-  writeFileSync(promptFile, prompt);
+  writeSearchContext();
+  const listingDir = syncListingToWorkspace(listing);
+  const taskDir = path.join(listingDir, 'claude', `listing-analysis-${Date.now()}`);
+  fs.mkdirSync(taskDir, { recursive: true });
+  const taskFile = path.join(taskDir, 'task.md');
+  const resultFile = path.join(taskDir, 'result.json');
+  const resultRel = path.relative(listingDir, resultFile);
 
-  try {
-    // Run claude with prompt from file via cat
-    const { stdout } = await execAsync(
-      `cat "${promptFile}" | claude --print --model haiku`,
-      {
-        timeout: 120000,  // 2 minute timeout
-        maxBuffer: 1024 * 1024,
-      }
-    );
+  const taskBody = `${prompt}
 
-    // Extract JSON from response (might be wrapped in markdown code block)
-    let jsonStr = stdout.trim();
+---
 
-    // Remove markdown code blocks if present
-    const jsonMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[1].trim();
-    }
+Write ONLY the JSON to: ${resultRel}
 
-    // Try to find JSON object
-    const objMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (!objMatch) {
-      throw new Error(`No JSON found in response: ${stdout.slice(0, 200)}`);
-    }
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+  fs.writeFileSync(taskFile, taskBody);
 
-    const analysis = JSON.parse(objMatch[0]) as ListingAnalysis;
+  await runClaudeTask({
+    workspaceDir: listingDir,
+    taskFile: path.relative(listingDir, taskFile),
+    resultFile: resultRel,
+    model: process.env.CLAUDE_MODEL_LISTING || process.env.CLAUDE_MODEL || undefined,
+    dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+    timeoutMs: 120000,
+    sentinel: CLAUDE_SENTINEL,
+  });
 
-    // Validate required fields
-    if (typeof analysis.recommendationScore !== 'number') {
-      analysis.recommendationScore = 50;
-    }
-    if (!analysis.estimatedCondition) {
-      analysis.estimatedCondition = 'unknown';
-    }
-    if (!Array.isArray(analysis.redFlags)) {
-      analysis.redFlags = [];
-    }
-    if (!Array.isArray(analysis.positives)) {
-      analysis.positives = [];
-    }
-    if (!Array.isArray(analysis.concerns)) {
-      analysis.concerns = [];
-    }
-
-    return analysis;
-  } catch (error: any) {
-    if (error.killed) {
-      throw new Error('Claude process timed out');
-    }
-    throw error;
-  } finally {
-    // Clean up temp file
-    try {
-      unlinkSync(promptFile);
-    } catch {}
+  if (!fs.existsSync(resultFile)) {
+    throw new Error('Claude did not write a result file');
   }
+
+  const raw = fs.readFileSync(resultFile, 'utf-8');
+  let jsonStr = raw.trim();
+
+  // Remove markdown code blocks if present
+  const jsonMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (jsonMatch) {
+    jsonStr = jsonMatch[1].trim();
+  }
+
+  const objMatch = jsonStr.match(/\{[\s\S]*\}/);
+  if (!objMatch) {
+    throw new Error(`No JSON found in response: ${raw.slice(0, 200)}`);
+  }
+
+  const analysis = JSON.parse(objMatch[0]) as ListingAnalysis;
+
+  // Validate required fields
+  if (typeof analysis.recommendationScore !== 'number') {
+    analysis.recommendationScore = 50;
+  }
+  if (!analysis.estimatedCondition) {
+    analysis.estimatedCondition = 'unknown';
+  }
+  if (!Array.isArray(analysis.redFlags)) {
+    analysis.redFlags = [];
+  }
+  if (!Array.isArray(analysis.positives)) {
+    analysis.positives = [];
+  }
+  if (!Array.isArray(analysis.concerns)) {
+    analysis.concerns = [];
+  }
+
+  return analysis;
 }
 
 function formatListingForAnalysis(listing: Listing): string {

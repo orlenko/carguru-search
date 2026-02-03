@@ -1,51 +1,64 @@
 import { Command } from 'commander';
 import { loadConfig } from '../../config.js';
 import { getDatabase } from '../../database/index.js';
-import { CarGurusScraper } from '../../scrapers/cargurus.js';
 import { AutoTraderScraper } from '../../scrapers/autotrader.js';
+
+function parseIntOption(value: string | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = parseInt(value, 10);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`Invalid ${name}: ${value}`);
+  }
+  return parsed;
+}
 
 export const searchCommand = new Command('search')
   .description('Search for vehicles matching your criteria')
-  .option('-s, --source <source>', 'Source to search (autotrader, cargurus)', 'autotrader')
   .option('--dry-run', 'Show what would be searched without saving')
   .option('--headless', 'Run browser in headless mode (may trigger bot detection)')
   .option('--slow-mo <ms>', 'Slow down browser actions by this many ms', '50')
+  .option('--make <make>', 'Override make from config')
+  .option('--model <model>', 'Override model from config')
+  .option('--year-min <year>', 'Override minimum year from config')
+  .option('--year-max <year>', 'Override maximum year from config')
+  .option('--price-max <price>', 'Override maximum price from config')
+  .option('--mileage-max <km>', 'Override maximum mileage (km) from config')
+  .option('--postal-code <code>', 'Override postal code from config')
+  .option('--radius-km <km>', 'Override search radius (km) from config')
   .action(async (options) => {
     try {
       const config = loadConfig();
       const db = getDatabase();
+      const search = {
+        ...config.search,
+        ...(options.make ? { make: options.make } : {}),
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.yearMin ? { yearMin: parseIntOption(options.yearMin, 'year-min') } : {}),
+        ...(options.yearMax ? { yearMax: parseIntOption(options.yearMax, 'year-max') } : {}),
+        ...(options.priceMax ? { priceMax: parseIntOption(options.priceMax, 'price-max') } : {}),
+        ...(options.mileageMax ? { mileageMax: parseIntOption(options.mileageMax, 'mileage-max') } : {}),
+        ...(options.postalCode ? { postalCode: options.postalCode } : {}),
+        ...(options.radiusKm ? { radiusKm: parseIntOption(options.radiusKm, 'radius-km') } : {}),
+      };
 
       console.log('\n🔍 Starting vehicle search...\n');
-      console.log(`Make: ${config.search.make}`);
-      console.log(`Model: ${config.search.model}`);
-      console.log(`Year: ${config.search.yearMin || 'any'} - ${config.search.yearMax || 'any'}`);
-      console.log(`Max mileage: ${config.search.mileageMax ? `${config.search.mileageMax.toLocaleString()} km` : 'any'}`);
-      console.log(`Max price: ${config.search.priceMax ? `$${config.search.priceMax.toLocaleString()}` : 'any'}`);
-      console.log(`Location: ${config.search.postalCode} (${config.search.radiusKm} km radius)`);
+      console.log(`Make: ${search.make}`);
+      console.log(`Model: ${search.model}`);
+      console.log(`Year: ${search.yearMin || 'any'} - ${search.yearMax || 'any'}`);
+      console.log(`Max mileage: ${search.mileageMax ? `${search.mileageMax.toLocaleString()} km` : 'any'}`);
+      console.log(`Max price: ${search.priceMax ? `$${search.priceMax.toLocaleString()}` : 'any'}`);
+      console.log(`Location: ${search.postalCode} (${search.radiusKm} km radius)`);
       console.log('');
 
-      const runId = db.startSearchRun(options.source, config.search);
-
-      let scraper;
+      const runId = db.startSearchRun('autotrader', search);
       const scraperOptions = {
         headless: options.headless || false,
         slowMo: parseInt(options.slowMo, 10),
       };
-
-      switch (options.source) {
-        case 'cargurus':
-          scraper = new CarGurusScraper(scraperOptions);
-          break;
-        case 'autotrader':
-          scraper = new AutoTraderScraper(scraperOptions);
-          break;
-        default:
-          console.error(`Unknown source: ${options.source}. Available: cargurus, autotrader`);
-          process.exit(1);
-      }
+      const scraper = new AutoTraderScraper(scraperOptions);
 
       try {
-        const result = await scraper.search(config.search);
+        const result = await scraper.search(search);
 
         const totalDisplay = result.totalFound > 0 ? `${result.totalFound} total, ` : '';
         console.log(`\nFound ${totalDisplay}${result.listings.length} listings scraped (${result.pagesFetched} pages)`);

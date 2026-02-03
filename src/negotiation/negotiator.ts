@@ -10,12 +10,14 @@
  * - Everything is documented (reference previous statements)
  */
 
-import { writeFileSync, unlinkSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { execAsync } from '../analyzers/listing-analyzer.js';
+import fs from 'fs';
+import path from 'path';
 import { getEnv } from '../config.js';
 import type { Listing } from '../database/client.js';
+import { runClaudeTask } from '../claude/task-runner.js';
+import { syncListingToWorkspace, writeSearchContext } from '../workspace/index.js';
+
+const CLAUDE_SENTINEL = 'task complete';
 
 export interface NegotiationContext {
   listing: Listing;
@@ -169,24 +171,48 @@ ${context.dealerConcessions.length > 0 ? `Dealer has agreed to: ${context.dealer
     .replace('{history}', historyStr)
     .replace('{dealer_message}', dealerMessage);
 
-  const promptFile = join(tmpdir(), `negotiation-${Date.now()}.txt`);
-  writeFileSync(promptFile, prompt);
+  writeSearchContext();
+  const listingDir = syncListingToWorkspace(context.listing);
+  const taskDir = path.join(listingDir, 'claude', `negotiation-${Date.now()}`);
+  fs.mkdirSync(taskDir, { recursive: true });
+  const taskFile = path.join(taskDir, 'task.md');
+  const resultFile = path.join(taskDir, 'result.json');
+  const resultRel = path.relative(listingDir, resultFile);
+
+  const taskBody = `${prompt}
+
+---
+
+Write ONLY the JSON to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+  fs.writeFileSync(taskFile, taskBody);
 
   try {
-    const { stdout } = await execAsync(
-      `cat "${promptFile}" | claude --print --model sonnet`,
-      { timeout: 120000, maxBuffer: 1024 * 1024 }
-    );
+    await runClaudeTask({
+      workspaceDir: listingDir,
+      taskFile: path.relative(listingDir, taskFile),
+      resultFile: resultRel,
+      model: process.env.CLAUDE_MODEL_NEGOTIATION || process.env.CLAUDE_MODEL || undefined,
+      dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+      timeoutMs: 120000,
+      sentinel: CLAUDE_SENTINEL,
+    });
 
-    // Extract JSON from response
-    const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+    if (!fs.existsSync(resultFile)) {
+      throw new Error('Claude did not write a result file');
+    }
+
+    const raw = fs.readFileSync(resultFile, 'utf-8');
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       throw new Error('No JSON in response');
     }
 
     const response = JSON.parse(jsonMatch[0]) as NegotiationResponse;
     return response;
-
   } catch (error) {
     // Fallback response
     return {
@@ -195,10 +221,6 @@ ${context.dealerConcessions.length > 0 ? `Dealer has agreed to: ${context.dealer
       reasoning: 'Fallback response - keeps negotiation open without committing',
       shouldEscalateToHuman: false,
     };
-  } finally {
-    try {
-      unlinkSync(promptFile);
-    } catch {}
   }
 }
 
@@ -248,22 +270,47 @@ Output JSON:
   "escalationReason": null
 }`;
 
-  const promptFile = join(tmpdir(), `negotiation-opener-${Date.now()}.txt`);
-  writeFileSync(promptFile, prompt);
+  writeSearchContext();
+  const listingDir = syncListingToWorkspace(context.listing);
+  const taskDir = path.join(listingDir, 'claude', `negotiation-opener-${Date.now()}`);
+  fs.mkdirSync(taskDir, { recursive: true });
+  const taskFile = path.join(taskDir, 'task.md');
+  const resultFile = path.join(taskDir, 'result.json');
+  const resultRel = path.relative(listingDir, resultFile);
+
+  const taskBody = `${prompt}
+
+---
+
+Write ONLY the JSON to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+  fs.writeFileSync(taskFile, taskBody);
 
   try {
-    const { stdout } = await execAsync(
-      `cat "${promptFile}" | claude --print --model sonnet`,
-      { timeout: 120000, maxBuffer: 1024 * 1024 }
-    );
+    await runClaudeTask({
+      workspaceDir: listingDir,
+      taskFile: path.relative(listingDir, taskFile),
+      resultFile: resultRel,
+      model: process.env.CLAUDE_MODEL_NEGOTIATION || process.env.CLAUDE_MODEL || undefined,
+      dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+      timeoutMs: 120000,
+      sentinel: CLAUDE_SENTINEL,
+    });
 
-    const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+    if (!fs.existsSync(resultFile)) {
+      throw new Error('Claude did not write a result file');
+    }
+
+    const raw = fs.readFileSync(resultFile, 'utf-8');
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       throw new Error('No JSON in response');
     }
 
     return JSON.parse(jsonMatch[0]) as NegotiationResponse;
-
   } catch (error) {
     // Fallback opener - simple and direct
     const concerns = context.listing.redFlags?.slice(0, 2).join(' and ') || 'some factors';
@@ -279,10 +326,6 @@ Would that work for you?`,
       suggestedOffer: openingOffer,
       shouldEscalateToHuman: false,
     };
-  } finally {
-    try {
-      unlinkSync(promptFile);
-    } catch {}
   }
 }
 

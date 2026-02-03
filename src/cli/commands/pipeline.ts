@@ -12,6 +12,7 @@ import { WebFormContact, generateContactMessage } from '../../contact/web-form.j
 import { EmailClient } from '../../email/client.js';
 import { generateEmail } from '../../email/templates.js';
 import { processEmailLinks, extractLinksFromEmail, filterRelevantLinks } from '../../email/link-processor.js';
+import { matchListingFromEmail } from '../../email/matching.js';
 import { shouldSkipEmail } from '../../email/filters.js';
 import { analyzeCarfaxBuffer } from '../../analyzers/carfax-analyzer.js';
 import { analyzeListingWithClaude } from '../../analyzers/listing-analyzer.js';
@@ -19,6 +20,15 @@ import { AutoTraderScraper } from '../../scrapers/autotrader.js';
 import type { ListingAnalysis } from '../../analyzers/listing-analyzer.js';
 import * as fs from 'fs';
 import * as path from 'path';
+
+function parseIntOption(value: string | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = parseInt(value, 10);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`Invalid ${name}: ${value}`);
+  }
+  return parsed;
+}
 
 interface PipelineOptions {
   dryRun: boolean;
@@ -30,6 +40,14 @@ interface PipelineOptions {
   skipOutreach: boolean;
   skipRespond: boolean;
   headless: boolean;
+  make?: string;
+  model?: string;
+  yearMin?: string;
+  yearMax?: string;
+  priceMax?: string;
+  mileageMax?: string;
+  postalCode?: string;
+  radiusKm?: string;
 }
 
 export const pipelineCommand = new Command('pipeline')
@@ -43,6 +61,14 @@ export const pipelineCommand = new Command('pipeline')
   .option('--skip-outreach', 'Skip the outreach phase')
   .option('--skip-respond', 'Skip the auto-respond phase')
   .option('--headless', 'Run browser in headless mode')
+  .option('--make <make>', 'Override make from config')
+  .option('--model <model>', 'Override model from config')
+  .option('--year-min <year>', 'Override minimum year from config')
+  .option('--year-max <year>', 'Override maximum year from config')
+  .option('--price-max <price>', 'Override maximum price from config')
+  .option('--mileage-max <km>', 'Override maximum mileage (km) from config')
+  .option('--postal-code <code>', 'Override postal code from config')
+  .option('--radius-km <km>', 'Override search radius (km) from config')
   .action(async (opts) => {
     const options: PipelineOptions = {
       dryRun: opts.dryRun ?? false,
@@ -54,6 +80,14 @@ export const pipelineCommand = new Command('pipeline')
       skipOutreach: opts.skipOutreach ?? false,
       skipRespond: opts.skipRespond ?? false,
       headless: opts.headless ?? false,
+      make: opts.make,
+      model: opts.model,
+      yearMin: opts.yearMin,
+      yearMax: opts.yearMax,
+      priceMax: opts.priceMax,
+      mileageMax: opts.mileageMax,
+      postalCode: opts.postalCode,
+      radiusKm: opts.radiusKm,
     };
 
     console.log('\n🚀 CAR SEARCH AUTOMATION PIPELINE\n');
@@ -65,7 +99,18 @@ export const pipelineCommand = new Command('pipeline')
 
     const config = loadConfig();
     const db = getDatabase();
-    const budget = config.search.priceMax || 18000;
+    const search = {
+      ...config.search,
+      ...(options.make ? { make: options.make } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.yearMin ? { yearMin: parseIntOption(options.yearMin, 'year-min') } : {}),
+      ...(options.yearMax ? { yearMax: parseIntOption(options.yearMax, 'year-max') } : {}),
+      ...(options.priceMax ? { priceMax: parseIntOption(options.priceMax, 'price-max') } : {}),
+      ...(options.mileageMax ? { mileageMax: parseIntOption(options.mileageMax, 'mileage-max') } : {}),
+      ...(options.postalCode ? { postalCode: options.postalCode } : {}),
+      ...(options.radiusKm ? { radiusKm: parseIntOption(options.radiusKm, 'radius-km') } : {}),
+    };
+    const budget = search.priceMax || 18000;
     const results = {
       searched: 0,
       newListings: 0,
@@ -85,14 +130,14 @@ export const pipelineCommand = new Command('pipeline')
 
       try {
         const searchParams = {
-          make: config.search.make,
-          model: config.search.model,
-          yearMin: config.search.yearMin,
-          yearMax: config.search.yearMax,
-          priceMax: config.search.priceMax,
-          mileageMax: config.search.mileageMax,
-          postalCode: config.search.postalCode,
-          radius: config.search.radiusKm,
+          make: search.make,
+          model: search.model,
+          yearMin: search.yearMin,
+          yearMax: search.yearMax,
+          priceMax: search.priceMax,
+          mileageMax: search.mileageMax,
+          postalCode: search.postalCode,
+          radius: search.radiusKm,
         };
 
         console.log(`Searching for: ${searchParams.make} ${searchParams.model}`);
@@ -106,7 +151,7 @@ export const pipelineCommand = new Command('pipeline')
             slowMo: 50,
           });
 
-          const searchResult = await scraper.search(config.search);
+          const searchResult = await scraper.search(search);
           results.searched = searchResult.listings.length;
 
           // Save to database
@@ -154,9 +199,15 @@ export const pipelineCommand = new Command('pipeline')
             db.updateListing(listing.id, {
               aiAnalysis: JSON.stringify(analysis),
               score: analysis.recommendationScore,
-              redFlags: analysis.concerns,
-              status: 'analyzed',
+              redFlags: analysis.redFlags,
             });
+            const transitionResult = db.transitionStatePath(listing.id, 'analyzed', {
+              triggeredBy: 'system',
+              reasoning: 'AI analysis completed',
+            });
+            if (!transitionResult.success) {
+              console.log(` ⚠️ State transition failed: ${transitionResult.error}`);
+            }
 
             // Calculate and persist cost breakdown
             if (listing.price) {
@@ -262,6 +313,7 @@ export const pipelineCommand = new Command('pipeline')
       // Filter candidates
       const candidates = ranked.filter(({ listing, score }) => {
         if (!score.passed || score.totalScore < options.minScore) return false;
+        if (listing.status !== 'analyzed') return false;
         if (listing.status === 'contacted' || listing.contactAttempts > 0) return false;
         if (listing.price) {
           const isDealer = listing.sellerType === 'dealer';
@@ -294,12 +346,19 @@ export const pipelineCommand = new Command('pipeline')
 
             if (result.success) {
               db.updateListing(listing.id, {
-                status: 'contacted',
                 lastContactedAt: new Date().toISOString(),
                 contactAttempts: (listing.contactAttempts || 0) + 1,
                 sellerEmail: result.dealerEmail,
                 sellerPhone: result.dealerPhone,
+                infoStatus: 'carfax_requested',
               });
+              const transitionResult = db.transitionStatePath(listing.id, 'awaiting_response', {
+                triggeredBy: 'system',
+                reasoning: 'Initial outreach sent',
+              });
+              if (!transitionResult.success) {
+                console.log(`    ⚠️ State transition failed: ${transitionResult.error}`);
+              }
               results.contacted++;
               console.log(`    ✅ Contacted`);
             } else {
@@ -331,6 +390,7 @@ export const pipelineCommand = new Command('pipeline')
       try {
         const emailClient = new EmailClient();
         const emails = await emailClient.fetchNewEmails();
+        const processedEmailIds = db.getProcessedEmailIds();
 
         console.log(`Found ${emails.length} new email(s)\n`);
 
@@ -342,23 +402,31 @@ export const pipelineCommand = new Command('pipeline')
           for (const email of emails) {
             console.log(`  From: ${email.from.slice(0, 50)}...`);
 
+            if (email.messageId && processedEmailIds.has(email.messageId)) {
+              console.log('    ⏭️  Already processed - skipping');
+              continue;
+            }
+
             // Skip noreply/automated/marketing emails
             const skipCheck = shouldSkipEmail(email);
             if (skipCheck.skip) {
               console.log(`    ⏭️  Skipping: ${skipCheck.reason}`);
+              if (!options.dryRun && email.messageId) {
+                db.markEmailProcessed({
+                  messageId: email.messageId,
+                  fromAddress: email.from,
+                  subject: email.subject,
+                  action: `skipped: ${skipCheck.reason}`,
+                });
+                processedEmailIds.add(email.messageId);
+              }
               continue;
             }
 
             results.emailsProcessed++;
 
             // Match to listing
-            const matchedListing = contactedListings.find(listing => {
-              if (listing.sellerEmail && email.from.includes(listing.sellerEmail)) return true;
-              if (listing.sellerName && email.from.toLowerCase().includes(listing.sellerName.toLowerCase())) return true;
-              const vehicle = `${listing.make} ${listing.model}`.toLowerCase();
-              if (email.subject.toLowerCase().includes(vehicle)) return true;
-              return false;
-            });
+            const matchedListing = matchListingFromEmail(email, contactedListings);
 
             if (matchedListing) {
               console.log(`    Matched to #${matchedListing.id}`);
@@ -422,6 +490,7 @@ export const pipelineCommand = new Command('pipeline')
                     db.updateListing(matchedListing.id, {
                       carfaxReceived: true,
                       carfaxPath,
+                      infoStatus: 'carfax_received',
                       accidentCount: analysis.data.accidentCount,
                       ownerCount: analysis.data.ownerCount,
                       serviceRecordCount: analysis.data.serviceRecordCount,
@@ -430,7 +499,11 @@ export const pipelineCommand = new Command('pipeline')
                     results.carfaxReceived++;
                     console.log(`    ✅ CARFAX analyzed: ${analysis.riskLevel} risk`);
                   } catch (e) {
-                    db.updateListing(matchedListing.id, { carfaxReceived: true, carfaxPath });
+                    db.updateListing(matchedListing.id, {
+                      carfaxReceived: true,
+                      carfaxPath,
+                      infoStatus: 'carfax_received',
+                    });
                     console.log(`    ⚠️ Saved but analysis failed`);
                   }
                 } else {
@@ -450,13 +523,44 @@ export const pipelineCommand = new Command('pipeline')
                     subject: `Re: ${email.subject}`,
                     text,
                   });
+                  db.updateListing(matchedListing.id, { infoStatus: 'carfax_requested' });
                   console.log('    ✅ CARFAX request sent');
                 } else {
                   console.log('    [DRY RUN] Would send CARFAX request');
                 }
               }
+
+              if (!options.dryRun) {
+                const transitionResult = db.transitionStatePath(matchedListing.id, 'negotiating', {
+                  triggeredBy: 'system',
+                  reasoning: 'Received seller response',
+                });
+                if (!transitionResult.success) {
+                  console.log(`    ⚠️ State transition failed: ${transitionResult.error}`);
+                }
+              }
+
+              if (!options.dryRun && email.messageId) {
+                db.markEmailProcessed({
+                  messageId: email.messageId,
+                  listingId: matchedListing.id,
+                  fromAddress: email.from,
+                  subject: email.subject,
+                  action: 'auto_respond_processed',
+                });
+                processedEmailIds.add(email.messageId);
+              }
             } else {
               console.log('    ❓ No matching listing');
+              if (!options.dryRun && email.messageId) {
+                db.markEmailProcessed({
+                  messageId: email.messageId,
+                  fromAddress: email.from,
+                  subject: email.subject,
+                  action: 'unmatched',
+                });
+                processedEmailIds.add(email.messageId);
+              }
             }
           }
         }

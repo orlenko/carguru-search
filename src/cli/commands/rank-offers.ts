@@ -6,14 +6,12 @@
 import { Command } from 'commander';
 import { getDatabase } from '../../database/index.js';
 import { loadConfig } from '../../config.js';
-import { spawn } from 'child_process';
-import { writeFileSync, unlinkSync, mkdirSync, existsSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import * as fs from 'fs';
+import path from 'path';
+import { runClaudeTask } from '../../claude/task-runner.js';
+import { writeSearchContext, WORKSPACE_DIR } from '../../workspace/index.js';
 
-const execAsync = promisify(exec);
+const CLAUDE_SENTINEL = 'task complete';
 
 interface RankedListing {
   id: number;
@@ -262,20 +260,39 @@ export const rankOffersCommand = new Command('rank-offers')
 
       const prompt = buildClaudePrompt(topListings.slice(0, 5), budget);
 
-      // Write prompt to temp file
-      const promptFile = join(tmpdir(), `rank-offers-${Date.now()}.txt`);
-      writeFileSync(promptFile, prompt);
+      writeSearchContext();
+      const taskDir = path.join(WORKSPACE_DIR, 'claude', `rank-offers-${Date.now()}`);
+      fs.mkdirSync(taskDir, { recursive: true });
+      const taskFile = path.join(taskDir, 'task.md');
+      const resultFile = path.join(taskDir, 'result.md');
+      const resultRel = path.relative(WORKSPACE_DIR, resultFile);
 
-      // Launch interactive Claude session
-      const claude = spawn('claude', ['-p', `$(cat "${promptFile}")`], {
-        cwd: process.cwd(),
-        stdio: 'inherit',
-        shell: true,
+      const taskBody = `${prompt}
+
+---
+
+Write your response in markdown to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+      fs.writeFileSync(taskFile, taskBody);
+
+      await runClaudeTask({
+        workspaceDir: WORKSPACE_DIR,
+        taskFile: path.relative(WORKSPACE_DIR, taskFile),
+        resultFile: resultRel,
+        model: process.env.CLAUDE_MODEL_RANK || process.env.CLAUDE_MODEL || undefined,
+        dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+        timeoutMs: 120000,
+        sentinel: CLAUDE_SENTINEL,
       });
 
-      claude.on('exit', () => {
-        try { unlinkSync(promptFile); } catch {}
-      });
+      if (fs.existsSync(resultFile)) {
+        console.log(fs.readFileSync(resultFile, 'utf-8').trim());
+      } else {
+        console.log('Claude did not write a result file.');
+      }
 
       return;
     }
@@ -283,10 +300,10 @@ export const rankOffersCommand = new Command('rank-offers')
     // Export to workspace
     if (options.export) {
       const exportDir = 'workspace/rankings';
-      mkdirSync(exportDir, { recursive: true });
+      fs.mkdirSync(exportDir, { recursive: true });
 
       const timestamp = new Date().toISOString().split('T')[0];
-      const exportPath = join(exportDir, `ranking-${timestamp}.md`);
+      const exportPath = path.join(exportDir, `ranking-${timestamp}.md`);
 
       let exportContent = `# Top Offers Ranking - ${timestamp}\n\n`;
       exportContent += `**Budget:** $${budget.toLocaleString()}\n\n`;
@@ -324,7 +341,7 @@ export const rankOffersCommand = new Command('rank-offers')
         exportContent += '\n---\n\n';
       }
 
-      writeFileSync(exportPath, exportContent);
+      fs.writeFileSync(exportPath, exportContent);
       console.log(`📁 Exported to ${exportPath}`);
     }
 
@@ -501,21 +518,41 @@ export const aiRankCommand = new Command('ai-rank')
 
     console.log('Analyzing top candidates with Claude...\n');
 
-    // Write prompt to temp file
-    const promptFile = join(tmpdir(), `ai-rank-${Date.now()}.txt`);
-    writeFileSync(promptFile, prompt);
+    writeSearchContext();
+    const taskDir = path.join(WORKSPACE_DIR, 'claude', `ai-rank-${Date.now()}`);
+    fs.mkdirSync(taskDir, { recursive: true });
+    const taskFile = path.join(taskDir, 'task.md');
+    const resultFile = path.join(taskDir, 'result.md');
+    const resultRel = path.relative(WORKSPACE_DIR, resultFile);
+
+    const taskBody = `${prompt}
+
+---
+
+Write your response in markdown to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+    fs.writeFileSync(taskFile, taskBody);
 
     try {
-      // Run Claude with print mode
-      const { stdout } = await execAsync(
-        `cat "${promptFile}" | claude --print --model sonnet`,
-        { timeout: 120000, maxBuffer: 1024 * 1024 }
-      );
+      await runClaudeTask({
+        workspaceDir: WORKSPACE_DIR,
+        taskFile: path.relative(WORKSPACE_DIR, taskFile),
+        resultFile: resultRel,
+        model: process.env.CLAUDE_MODEL_RANK || process.env.CLAUDE_MODEL || undefined,
+        dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+        timeoutMs: 120000,
+        sentinel: CLAUDE_SENTINEL,
+      });
 
-      console.log(stdout);
+      if (fs.existsSync(resultFile)) {
+        console.log(fs.readFileSync(resultFile, 'utf-8').trim());
+      } else {
+        console.log('Claude did not write a result file.');
+      }
     } catch (error) {
       console.error('Claude analysis failed:', error);
-    } finally {
-      try { unlinkSync(promptFile); } catch {}
     }
   });

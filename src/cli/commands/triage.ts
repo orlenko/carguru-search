@@ -143,7 +143,7 @@ async function promptUser(rl: readline.Interface, prompt: string): Promise<strin
 export const triageCommand = new Command('triage')
   .description('Interactively triage new listings')
   .option('-l, --limit <number>', 'Maximum listings to show', '20')
-  .option('-s, --status <status>', 'Filter by status (default: discovered)', 'discovered')
+  .option('-s, --status <status>', 'Filter by status (default: discovered,new)', 'discovered,new')
   .option('--min-score <number>', 'Only show listings with score >= value')
   .action(async (options) => {
     const db = getDatabase();
@@ -190,7 +190,15 @@ export const triageCommand = new Command('triage')
         switch (answer) {
           case 'i':
           case 'interesting':
-            db.updateListing(listing.id, { status: 'analyzed' });
+            {
+              const transitionResult = db.transitionStatePath(listing.id, 'analyzed', {
+                triggeredBy: 'user',
+                reasoning: 'Manually marked as interesting',
+              });
+              if (!transitionResult.success) {
+                console.log(`  ⚠️ State transition failed: ${transitionResult.error}`);
+              }
+            }
             console.log(`  -> Marked as ANALYZED (ready to contact)`);
             triaged++;
             interesting++;
@@ -199,7 +207,15 @@ export const triageCommand = new Command('triage')
 
           case 's':
           case 'skip':
-            db.updateListing(listing.id, { status: 'rejected' });
+            {
+              const transitionResult = db.transitionStatePath(listing.id, 'rejected', {
+                triggeredBy: 'user',
+                reasoning: 'Manually rejected during triage',
+              });
+              if (!transitionResult.success) {
+                console.log(`  ⚠️ State transition failed: ${transitionResult.error}`);
+              }
+            }
             console.log(`  -> Marked as REJECTED`);
             triaged++;
             skipped++;

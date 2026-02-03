@@ -1,143 +1,16 @@
 import { Command } from 'commander';
 import { getDatabase } from '../../database/index.js';
-import { EmailClient, saveEmailAttachments } from '../../email/client.js';
+import { EmailClient } from '../../email/client.js';
 import { extractLinksFromEmail, filterRelevantLinks, processEmailLinks } from '../../email/link-processor.js';
 import { shouldSkipEmail } from '../../email/filters.js';
-import { spawn } from 'child_process';
+import { matchListingFromEmail } from '../../email/matching.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Listing, ConversationMessage } from '../../database/client.js';
+import { runClaudeTask } from '../../claude/task-runner.js';
+import { syncListingToWorkspace, writeSearchContext, WORKSPACE_DIR } from '../../workspace/index.js';
 
-const WORKSPACE_DIR = 'workspace';
-const LISTINGS_DIR = path.join(WORKSPACE_DIR, 'listings');
-
-/**
- * Get the workspace directory name for a listing
- */
-function getListingDirName(listing: { id: number; year: number; make: string; model: string }): string {
-  const slug = `${listing.year}-${listing.make}-${listing.model}`
-    .toLowerCase()
-    .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9-]/g, '');
-  return `${String(listing.id).padStart(3, '0')}-${slug}`;
-}
-
-/**
- * Sync a listing to the workspace
- */
-function syncListingToWorkspace(listing: Listing): string {
-  const dirName = getListingDirName(listing);
-  const listingDir = path.join(LISTINGS_DIR, dirName);
-  const emailsDir = path.join(listingDir, 'emails');
-  const attachmentsDir = path.join(listingDir, 'attachments');
-
-  fs.mkdirSync(emailsDir, { recursive: true });
-  fs.mkdirSync(attachmentsDir, { recursive: true });
-
-  // Write listing.md
-  const listingMd = `# ${listing.year} ${listing.make} ${listing.model}
-
-## Quick Facts
-
-| Field | Value |
-|-------|-------|
-| **Price** | $${listing.price?.toLocaleString() || 'N/A'} |
-| **Mileage** | ${listing.mileageKm?.toLocaleString() || 'N/A'} km |
-| **Location** | ${listing.city || ''}${listing.city && listing.province ? ', ' : ''}${listing.province || 'N/A'} |
-| **Seller** | ${listing.sellerName || 'Unknown'} |
-| **Seller Type** | ${listing.sellerType || 'Unknown'} |
-| **VIN** | ${listing.vin || 'N/A'} |
-| **Status** | ${listing.status} |
-
-## Seller Contact
-
-- **Phone:** ${listing.sellerPhone || 'N/A'}
-- **Email:** ${listing.sellerEmail || 'N/A'}
-
-## Listing URL
-
-${listing.sourceUrl}
-
-## Description
-
-${listing.description || 'No description available.'}
-
-## Notes
-
-${listing.notes || 'None'}
-`;
-
-  fs.writeFileSync(path.join(listingDir, 'listing.md'), listingMd);
-
-  // Write analysis.md if we have AI analysis
-  if (listing.aiAnalysis) {
-    try {
-      const analysis = JSON.parse(listing.aiAnalysis);
-      const analysisMd = `# AI Analysis
-
-## Summary
-
-${analysis.summary || 'No summary available.'}
-
-## Score
-
-**Overall Score:** ${analysis.score || 'N/A'}/100
-
-## Red Flags
-
-${analysis.redFlags?.map((f: string) => `- ${f}`).join('\n') || 'None identified'}
-
-## Positive Factors
-
-${analysis.positives?.map((p: string) => `- ${p}`).join('\n') || 'None identified'}
-
-## Recommendation
-
-${analysis.recommendation || 'No recommendation available.'}
-`;
-      fs.writeFileSync(path.join(listingDir, 'analysis.md'), analysisMd);
-    } catch {
-      // Invalid JSON, skip
-    }
-  }
-
-  // Copy CARFAX if exists (could be a PDF file or a directory of images)
-  if (listing.carfaxPath && fs.existsSync(listing.carfaxPath)) {
-    const carfaxStat = fs.statSync(listing.carfaxPath);
-    if (carfaxStat.isDirectory()) {
-      // It's a directory of CARFAX images - copy all files
-      const carfaxImagesDir = path.join(listingDir, 'carfax-images');
-      fs.mkdirSync(carfaxImagesDir, { recursive: true });
-      const files = fs.readdirSync(listing.carfaxPath);
-      for (const file of files) {
-        const srcPath = path.join(listing.carfaxPath, file);
-        const destPath = path.join(carfaxImagesDir, file);
-        if (fs.statSync(srcPath).isFile()) {
-          fs.copyFileSync(srcPath, destPath);
-        }
-      }
-    } else {
-      // It's a PDF file
-      fs.copyFileSync(listing.carfaxPath, path.join(listingDir, 'carfax.pdf'));
-    }
-  }
-
-  if (listing.carfaxSummary) {
-    const carfaxMd = `# CARFAX Summary
-
-${listing.carfaxSummary}
-
-## Key Data
-
-- **Accidents:** ${listing.accidentCount ?? 'Unknown'}
-- **Owners:** ${listing.ownerCount ?? 'Unknown'}
-- **Service Records:** ${listing.serviceRecordCount ?? 'Unknown'}
-`;
-    fs.writeFileSync(path.join(listingDir, 'carfax-summary.md'), carfaxMd);
-  }
-
-  return listingDir;
-}
+const CLAUDE_SENTINEL = 'task complete';
 
 /**
  * Save an email to the workspace
@@ -174,7 +47,10 @@ ${email.text}
  * Build context summary of all active listings for cross-leverage
  */
 function buildCrossListingContext(db: ReturnType<typeof getDatabase>): string {
-  const contacted = db.listListings({ status: 'contacted', limit: 50 });
+  const contacted = db.listListings({
+    status: ['contacted', 'awaiting_response', 'negotiating'] as any,
+    limit: 50,
+  });
 
   if (contacted.length === 0) {
     return 'No other active listings.';
@@ -356,88 +232,65 @@ Important:
 - NEVER include a phone number in responses - only sign with name "Vlad"
 - Do NOT make up or hallucinate any contact information`;
 
-  if (debug) console.log('   [DEBUG] Spawning Claude CLI with Opus model...');
+  const model = process.env.CLAUDE_MODEL_SMART_RESPOND || process.env.CLAUDE_MODEL;
+  const dangerous = process.env.CLAUDE_DANGEROUS !== 'false';
 
-  return new Promise((resolve, reject) => {
-    // Use --print flag for non-interactive mode
-    // Use Opus model for best analysis quality
-    // Pass prompt via stdin to handle long prompts safely
-    const args = ['--print', '--model', 'opus'];
+  if (debug) {
+    console.log(`   [DEBUG] Writing Claude task file...`);
+  }
 
-    if (debug) console.log(`   [DEBUG] Prompt length: ${prompt.length} chars, using opus model, passing via stdin`);
+  const taskDir = path.join(listingDir, 'claude', `smart-respond-${Date.now()}`);
+  fs.mkdirSync(taskDir, { recursive: true });
+  const taskFile = path.join(taskDir, 'task.md');
+  const resultFile = path.join(taskDir, 'result.json');
+  const resultRel = path.relative(listingDir, resultFile);
 
-    const claude = spawn('claude', args, {
-      cwd: process.cwd(),
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, NO_COLOR: '1' },
-    });
+  const taskBody = `${prompt}
 
-    // Write prompt to stdin and close it
-    if (claude.stdin) {
-      claude.stdin.write(prompt);
-      claude.stdin.end();
-    }
+---
 
-    let output = '';
-    let errorOutput = '';
+## Output Instructions
 
-    // Add timeout (60 seconds)
-    const timeout = setTimeout(() => {
-      claude.kill();
-      reject(new Error('Claude timed out after 60 seconds'));
-    }, 60000);
+Write ONLY the JSON to: ${resultRel}
 
-    claude.stdout?.on('data', (data) => {
-      const chunk = data.toString();
-      output += chunk;
-      if (debug) console.log(`   [DEBUG] stdout chunk: ${chunk.slice(0, 100)}...`);
-    });
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
 
-    claude.stderr?.on('data', (data) => {
-      const chunk = data.toString();
-      errorOutput += chunk;
-      if (debug) console.log(`   [DEBUG] stderr: ${chunk}`);
-    });
+  fs.writeFileSync(taskFile, taskBody);
 
-    claude.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(new Error(`Failed to invoke Claude: ${err.message}`));
-    });
+  if (debug) {
+    console.log(`   [DEBUG] Task file: ${taskFile}`);
+    console.log(`   [DEBUG] Result file: ${resultFile}`);
+  }
 
-    claude.on('exit', (code) => {
-      clearTimeout(timeout);
-
-      if (debug) {
-        console.log(`   [DEBUG] Claude exited with code ${code}`);
-        console.log(`   [DEBUG] Output length: ${output.length}`);
-      }
-
-      if (code !== 0) {
-        reject(new Error(`Claude exited with code ${code}: ${errorOutput}`));
-        return;
-      }
-
-      try {
-        // Find JSON in output
-        const jsonMatch = output.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const result = JSON.parse(jsonMatch[0]);
-          resolve({
-            classification: result.classification || 'unknown',
-            action: result.action || 'needs_review',
-            response: result.response || null,
-            reasoning: result.reasoning || '',
-          });
-        } else {
-          console.log('   [WARN] No JSON in response, raw output:');
-          console.log(output.slice(0, 500));
-          reject(new Error('No JSON found in Claude response'));
-        }
-      } catch (e) {
-        reject(new Error(`Failed to parse Claude response: ${e}`));
-      }
-    });
+  await runClaudeTask({
+    workspaceDir: listingDir,
+    taskFile: path.relative(listingDir, taskFile),
+    resultFile: resultRel,
+    model: model || undefined,
+    dangerous,
+    timeoutMs: 60000,
+    sentinel: CLAUDE_SENTINEL,
+    debug,
   });
+
+  if (!fs.existsSync(resultFile)) {
+    throw new Error('Claude did not write a result file');
+  }
+
+  const raw = fs.readFileSync(resultFile, 'utf-8');
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    throw new Error('No JSON found in Claude result file');
+  }
+  const result = JSON.parse(jsonMatch[0]);
+  return {
+    classification: result.classification || 'unknown',
+    action: result.action || 'needs_review',
+    response: result.response || null,
+    reasoning: result.reasoning || '',
+  };
 }
 
 export const smartRespondCommand = new Command('smart-respond')
@@ -447,6 +300,7 @@ export const smartRespondCommand = new Command('smart-respond')
   .option('--debug', 'Enable debug logging')
   .option('--include-read', 'Also check read emails (reprocess previously seen emails)')
   .option('--since <days>', 'Only check emails from last N days when using --include-read', '3')
+  .option('--reprocess', 'Ignore processed-email dedupe and reprocess matching emails')
   .action(async (options) => {
     try {
       const db = getDatabase();
@@ -456,6 +310,7 @@ export const smartRespondCommand = new Command('smart-respond')
       const debug = options.debug ?? false;
       const includeRead = options.includeRead ?? false;
       const sinceDays = parseInt(options.since);
+      const reprocess = options.reprocess ?? false;
 
       console.log('\n🤖 Smart Auto-Respond\n');
       if (includeRead) {
@@ -464,8 +319,8 @@ export const smartRespondCommand = new Command('smart-respond')
         console.log('Checking for new emails...');
       }
 
-      // Ensure workspace exists
-      fs.mkdirSync(LISTINGS_DIR, { recursive: true });
+      // Ensure workspace root + search context exists
+      writeSearchContext();
 
       // Fetch emails - optionally include read emails
       const since = includeRead ? new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000) : undefined;
@@ -492,8 +347,8 @@ export const smartRespondCommand = new Command('smart-respond')
       let sold = 0;
       let duplicates = 0;
 
-      // Pre-load processed email IDs for efficiency
-      const processedEmailIds = db.getProcessedEmailIds();
+      // Pre-load processed email IDs for efficiency (unless reprocessing)
+      const processedEmailIds = reprocess ? new Set<string>() : db.getProcessedEmailIds();
 
       for (const email of emails.slice(0, limit)) {
         console.log('─'.repeat(70));
@@ -501,7 +356,7 @@ export const smartRespondCommand = new Command('smart-respond')
         console.log(`Subject: ${email.subject}`);
 
         // Check for duplicate (already processed email)
-        if (email.messageId && processedEmailIds.has(email.messageId)) {
+        if (!reprocess && email.messageId && processedEmailIds.has(email.messageId)) {
           console.log(`⏭️  Already processed (duplicate) - skipping`);
           duplicates++;
           continue;
@@ -525,14 +380,7 @@ export const smartRespondCommand = new Command('smart-respond')
         }
 
         // Try to match email to a listing
-        const matchedListing = contactedListings.find(listing => {
-          if (listing.sellerEmail && email.from.toLowerCase().includes(listing.sellerEmail.toLowerCase())) return true;
-          if (listing.sellerName && email.from.toLowerCase().includes(listing.sellerName.toLowerCase())) return true;
-          const vehicle = `${listing.make} ${listing.model}`.toLowerCase();
-          if (email.subject.toLowerCase().includes(vehicle)) return true;
-          if (email.text.toLowerCase().includes(vehicle)) return true;
-          return false;
-        });
+        const matchedListing = matchListingFromEmail(email, contactedListings);
 
         if (!matchedListing) {
           console.log('❓ Could not match to any listing - skipping');
@@ -629,6 +477,7 @@ export const smartRespondCommand = new Command('smart-respond')
           db.updateListing(matchedListing.id, {
             carfaxReceived: true,
             carfaxPath,
+            infoStatus: 'carfax_received',
           });
           console.log(`      Saved: ${carfaxPath}`);
           carfaxJustReceived = true;
@@ -669,6 +518,7 @@ export const smartRespondCommand = new Command('smart-respond')
           db.updateListing(matchedListing.id, {
             carfaxReceived: true,
             carfaxPath: imagesDir,
+            infoStatus: 'carfax_received',
           });
           carfaxJustReceived = true;
 
@@ -728,6 +578,15 @@ export const smartRespondCommand = new Command('smart-respond')
           sellerConversation: [...existingConversation, newMessage],
           lastSellerResponseAt: new Date().toISOString(),
         });
+        if (!dryRun) {
+          const transitionResult = db.transitionStatePath(matchedListing.id, 'negotiating', {
+            triggeredBy: 'system',
+            reasoning: 'Received seller response',
+          });
+          if (!transitionResult.success) {
+            console.log(`⚠️ State transition failed: ${transitionResult.error}`);
+          }
+        }
 
         // Invoke Claude for analysis
         console.log('🧠 Analyzing with Claude...');
@@ -750,7 +609,15 @@ export const smartRespondCommand = new Command('smart-respond')
           // Handle special actions
           if (analysis.action === 'mark_sold') {
             console.log('🚫 Car sold - marking as unavailable');
-            db.updateListing(matchedListing.id, { status: 'rejected' });
+            if (!dryRun) {
+              const transitionResult = db.transitionStatePath(matchedListing.id, 'rejected', {
+                triggeredBy: 'system',
+                reasoning: 'Seller indicated vehicle is sold',
+              });
+              if (!transitionResult.success) {
+                console.log(`⚠️ State transition failed: ${transitionResult.error}`);
+              }
+            }
             sold++;
             continue;
           }
@@ -866,7 +733,10 @@ export const recommendCommand = new Command('recommend')
       console.log('\n🏆 Getting Purchase Recommendation\n');
 
       // Get all contacted listings with CARFAX
-      const listings = db.listListings({ status: 'contacted', limit: 100 });
+      const listings = db.listListings({
+        status: ['contacted', 'awaiting_response', 'negotiating'] as any,
+        limit: 100,
+      });
       const withCarfax = listings.filter(l => l.carfaxReceived);
 
       if (withCarfax.length === 0) {
@@ -911,15 +781,41 @@ Respond in markdown format with clear sections.`;
 
       console.log('Analyzing listings with Claude...\n');
 
-      const claude = spawn('claude', ['-p', prompt], {
-        cwd: WORKSPACE_DIR,
-        stdio: 'inherit',
+      writeSearchContext();
+      const taskDir = path.join(WORKSPACE_DIR, 'claude', `recommend-${Date.now()}`);
+      fs.mkdirSync(taskDir, { recursive: true });
+      const taskFile = path.join(taskDir, 'task.md');
+      const resultFile = path.join(taskDir, 'result.md');
+      const resultRel = path.relative(WORKSPACE_DIR, resultFile);
+
+      const taskBody = `${prompt}
+
+---
+
+Write your response in markdown to: ${resultRel}
+
+After writing the file, output this line exactly:
+${CLAUDE_SENTINEL}
+`;
+      fs.writeFileSync(taskFile, taskBody);
+
+      await runClaudeTask({
+        workspaceDir: WORKSPACE_DIR,
+        taskFile: path.relative(WORKSPACE_DIR, taskFile),
+        resultFile: resultRel,
+        model: process.env.CLAUDE_MODEL || undefined,
+        dangerous: process.env.CLAUDE_DANGEROUS !== 'false',
+        timeoutMs: 120000,
+        sentinel: CLAUDE_SENTINEL,
       });
 
-      claude.on('error', (err) => {
-        console.error('Failed to invoke Claude:', err);
+      if (!fs.existsSync(resultFile)) {
+        console.error('Claude did not write a result file.');
         process.exit(1);
-      });
+      }
+
+      const output = fs.readFileSync(resultFile, 'utf-8');
+      console.log(output.trim());
 
     } catch (error) {
       console.error('Recommendation failed:', error);

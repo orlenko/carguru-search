@@ -4,7 +4,7 @@ import { getDatabase, type ListingStatus } from '../../database/index.js';
 export const listCommand = new Command('list')
   .description('List discovered vehicles')
   .option('-s, --status <status>', 'Filter by status (new, shortlisted, rejected, etc.)')
-  .option('--source <source>', 'Filter by source (cargurus, autotrader)')
+  .option('--source <source>', 'Filter by source (autotrader)')
   .option('-n, --limit <number>', 'Limit number of results', '20')
   .option('--order <field>', 'Order by field (score, price, mileage, discovered)', 'discovered')
   .action(async (options) => {
